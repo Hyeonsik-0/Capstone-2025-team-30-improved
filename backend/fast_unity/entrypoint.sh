@@ -24,9 +24,14 @@ if [ ! -f /root/.vnc/passwd ]; then
   x11vnc -storepasswd "${VNC_PASS:-changeme}" /root/.vnc/passwd
 fi
 
-# 3) Unity 실행파일 권한
+# 3) Unity 실행파일 권한 (이슈 #3)
+#    git에 실행 권한(755)이 기록되어 있어 보통은 할 일이 없고, 권한이 빠진 경우의 안전망이다.
+#    실행 파일은 envs/<환경>/env.x86_64 깊이에 있으므로 -maxdepth 2로 찾는다.
+#    읽기 전용 마운트 등으로 chmod가 실패해도 기동은 계속한다.
 if [ -d /app/unity/envs ]; then
-  find /app/unity/envs -maxdepth 1 -type f -name "*.x86_64" -print -exec chmod +x {} \;
+  find /app/unity/envs -maxdepth 2 -type f -name "*.x86_64" ! -perm -u+x -print \
+    -exec chmod +x {} + 2>/dev/null \
+    || echo "[entrypoint] WARN: Unity 실행 권한 부여 실패" >&2
 fi
 
 # 4) 윈도우 매니저 (선택)
