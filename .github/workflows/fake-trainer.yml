@@ -1,0 +1,71 @@
+# 학습 서버 대역 시나리오 (이슈 #7)
+# - 학습 서버 자리에 대역을 띄운 구성(MongoDB + BFF + 대역)에서 측정 시나리오를 실행한다.
+# - 대역 이미지는 backend/fast_unity/app(실제 HTTP 계층)을 그대로 복사하므로,
+#   실제 라우트·스키마가 바뀌어 대역과 맞지 않게 되면 여기서 드러난다.
+# - 결과 JSON과 컨테이너 로그를 아티팩트로 남긴다.
+name: fake-trainer-scenarios
+
+on:
+  pull_request:
+    branches: [develop]
+  push:
+    branches: [develop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: fake-trainer-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  COMPOSE: docker compose -p rl-fake -f docker-compose.yml -f tools/fake-trainer/compose.fake.yml
+
+jobs:
+  scenarios:
+    name: 대역 구성 기동 + 측정 시나리오
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: 구성 기동
+        run: |
+          docker compose version
+          $COMPOSE up -d --build --wait mongodb api-server mlagents-gym
+          for i in $(seq 1 60); do
+            curl -sf http://127.0.0.1:18080/api/algorithms >/dev/null && break
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:18080/api/algorithms
+          echo
+          curl -sf http://127.0.0.1:18000/_fake/state
+
+      - name: 측정 시나리오 실행
+        run: |
+          mkdir -p ci-out
+          python3 tools/fake-trainer/scenarios/run_scenarios.py all --out ci-out/fake-trainer-results.json
+
+      - name: 컨테이너 로그 저장
+        if: always()
+        run: |
+          mkdir -p ci-out
+          for s in mongodb api-server mlagents-gym; do
+            $COMPOSE logs --no-color "$s" > "ci-out/$s.log" 2>&1 || true
+          done
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: fake-trainer-scenarios
+          path: ci-out/
+          retention-days: 30
+
+      - name: 정리
+        if: always()
+        run: $COMPOSE down -v || true
