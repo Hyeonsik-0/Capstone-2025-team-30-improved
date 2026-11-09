@@ -25,13 +25,17 @@ ENV PYTHONPATH=/app
 
 
 
-# Python 의존성: 해시까지 고정한 lock 파일 하나로 설치한다. (이슈 #3)
-# - torch는 CPU 빌드를 PyTorch CPU 저장소에서 받는다.
+# Python 의존성: 해시까지 고정한 lock 파일로 설치한다. (이슈 #3)
+# - pip는 베이스 이미지에 포함된 버전을 그대로 쓴다. (버전 미지정 업그레이드 제거)
+# - gym·pettingzoo는 소스 배포판만 있어 설치 중 빌드가 필요하다. 빌드 도구도 lock으로
+#   먼저 고정 설치하고, --no-build-isolation으로 그 도구를 써서 빌드한다.
 # - lock에 하위 의존성까지 모두 고정되어 있으므로 --no-deps로 다시 해석하지 않는다.
 #   (SB3 2.6.0과 torch 2.1.2의 버전 충돌은 overrides.txt 참고)
-# - pip는 베이스 이미지에 포함된 버전을 그대로 쓴다. (버전 미지정 업그레이드 제거)
-COPY fast_unity/requirements.lock /tmp/requirements.lock
-RUN pip install --no-cache-dir --require-hashes --no-deps \
+# - torch는 CPU 빌드를 PyTorch CPU 저장소에서 받는다. lock 파일 안에 --index-url을 넣으면
+#   명령줄의 저장소 설정이 덮어써지므로, 저장소는 여기 명령줄에서만 지정한다.
+COPY fast_unity/build-requirements.lock fast_unity/requirements.lock /tmp/
+RUN pip install --no-cache-dir --require-hashes --no-deps -r /tmp/build-requirements.lock \
+ && pip install --no-cache-dir --require-hashes --no-deps --no-build-isolation \
       --extra-index-url https://download.pytorch.org/whl/cpu \
       -r /tmp/requirements.lock
 

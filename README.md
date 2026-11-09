@@ -196,19 +196,24 @@ docker compose up --build
 | 대상 | 고정 방식 |
 | --- | --- |
 | 학습 서버 Python 의존성 | `backend/fast_unity/requirements.lock` (하위 의존성까지 해시 포함 고정, 2025-09-30 시점 기준) |
+| 소스 빌드 도구 | `backend/fast_unity/build-requirements.lock` (gym·pettingzoo는 소스 배포판만 있어 설치 중 빌드되므로 setuptools·wheel도 해시 포함 고정) |
 | Node 의존성 | 각 `package-lock.json` + `npm ci` |
 | 베이스·서비스 이미지 | 버전 태그 고정 (예: `node:20.19.5-alpine3.22`, `mongo:7.0.23`, `nginx:1.29.1-alpine3.22`) |
 | 학습 서버 플랫폼 | `linux/amd64` (Unity 환경 실행 파일이 x86_64 전용) |
 
 - **알려진 버전 충돌**: SB3 2.6.0은 torch 2.3 이상을 요구하지만, 당시 학습 서버는 torch 2.1.2(CPU)로 동작했습니다. 재현이 목적이므로 `backend/fast_unity/overrides.txt`로 torch 2.1.2를 유지합니다.
-- **lock 재생성**: 최상위 의존성은 `requirements.in`에서 관리하고, `backend/fast_unity`에서 아래 명령으로 lock을 다시 만듭니다. (`uv` 필요)
+- **lock 재생성**: 최상위 의존성은 `requirements.in`, `build-requirements.in`에서 관리하고, `backend/fast_unity`에서 아래 명령으로 lock을 다시 만듭니다. (`uv` 필요)
 
   ```bash
   uv pip compile requirements.in --override overrides.txt --torch-backend cpu \
     --python-version 3.10.12 --python-platform x86_64-manylinux_2_28 \
-    --exclude-newer 2025-09-30T15:00:00Z --generate-hashes --emit-index-url \
-    -o requirements.lock
+    --exclude-newer 2025-09-30T15:00:00Z --generate-hashes -o requirements.lock
+  uv pip compile build-requirements.in \
+    --python-version 3.10.12 --python-platform x86_64-manylinux_2_28 \
+    --exclude-newer 2025-09-30T15:00:00Z --generate-hashes -o build-requirements.lock
   ```
+
+  lock 파일 안에 `--index-url`을 넣으면 Dockerfile 명령줄의 PyTorch 저장소 설정이 덮어써지므로 `--emit-index-url`은 쓰지 않습니다.
 
 - **자동 확인**: GitHub Actions(`.github/workflows/build.yml`)가 PR과 매주 1회 전체 이미지를 캐시 없이 빌드하고, 학습 서버 이미지의 설치 목록이 lock과 일치하는지, x86 환경에서 Unity가 실제로 기동하는지 확인합니다.
 

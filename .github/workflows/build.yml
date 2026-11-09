@@ -79,13 +79,15 @@ jobs:
 
       - name: 두 빌드의 설치 목록 비교
         run: |
-          docker run --rm --entrypoint pip mlagents-gym:first freeze > "$RUNNER_TEMP/freeze-first.txt"
-          docker run --rm --entrypoint pip mlagents-gym:second freeze > "$RUNNER_TEMP/freeze-second.txt"
+          docker run --rm --entrypoint pip mlagents-gym:first freeze --all > "$RUNNER_TEMP/freeze-first.txt"
+          docker run --rm --entrypoint pip mlagents-gym:second freeze --all > "$RUNNER_TEMP/freeze-second.txt"
           diff -u "$RUNNER_TEMP/freeze-first.txt" "$RUNNER_TEMP/freeze-second.txt"
           echo "두 빌드의 설치 목록 일치 ($(wc -l < "$RUNNER_TEMP/freeze-first.txt")개)"
 
       - name: 설치 목록과 lock 파일 비교
-        run: python3 .github/scripts/compare_lock.py backend/fast_unity/requirements.lock "$RUNNER_TEMP/freeze-first.txt"
+        run: |
+          python3 .github/scripts/compare_lock.py "$RUNNER_TEMP/freeze-first.txt" \
+            backend/fast_unity/requirements.lock backend/fast_unity/build-requirements.lock
 
       - name: Unity 기동 확인 (handshake + 첫 reset)
         timeout-minutes: 10
@@ -105,7 +107,7 @@ jobs:
             echo "- 소스 ref: \`${{ inputs.ref || github.ref }}\` (\`$(git rev-parse --short HEAD)\`)"
             if [ -f "$RUNNER_TEMP/freeze-first.txt" ]; then
               echo "- 주요 패키지:"
-              grep -iE '^(torch|stable.baselines3|mlagents.envs|gymnasium|fastapi|openai|uvicorn|numpy)==' "$RUNNER_TEMP/freeze-first.txt" | sed 's/^/  - /'
+              grep -iE '^(torch|stable.baselines3|mlagents.envs|gymnasium|gym|fastapi|openai|uvicorn|numpy|setuptools)==' "$RUNNER_TEMP/freeze-first.txt" | sed 's/^/  - /'
             fi
             if [ -f "$RUNNER_TEMP/unity-out/smoke.txt" ]; then
               echo "- Unity 기동:"

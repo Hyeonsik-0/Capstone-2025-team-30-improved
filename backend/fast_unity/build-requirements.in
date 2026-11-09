@@ -1,0 +1,5 @@
+# 소스 배포판만 있는 패키지(gym 0.26.2, pettingzoo 1.15.0)를 빌드할 때 쓰는 도구 (이슈 #3)
+# 빌드 격리 환경이 최신 도구를 받아오지 않도록, 해시까지 고정해 먼저 설치하고
+# requirements.lock 설치는 --no-build-isolation으로 이 도구를 쓴다.
+setuptools
+wheel
