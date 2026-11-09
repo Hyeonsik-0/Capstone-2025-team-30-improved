@@ -2,7 +2,7 @@
 **/node_modules
 **/npm-debug.log
 **/yarn-error.log
-**/package-lock.json
+# package-lock.json은 npm ci가 lock 기준으로 설치하도록 빌드 컨텍스트에 포함한다. (이슈 #3)
 **/yarn.lock
 
 # Build outputs
