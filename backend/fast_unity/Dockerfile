@@ -25,19 +25,16 @@ ENV PYTHONPATH=/app
 
 
 
-RUN pip install --no-cache-dir "torch==2.1.2" --index-url https://download.pytorch.org/whl/cpu 
-RUN pip install --no-cache-dir --upgrade pip\
-    mlagents-envs==1.1.0 \
-    gymnasium==1.1.1 \
-    tensorboard \
-    requests\
-    websocket-client \
-    openai
+# Python 의존성: 해시까지 고정한 lock 파일 하나로 설치한다. (이슈 #3)
+# - torch는 CPU 빌드를 PyTorch CPU 저장소에서 받는다.
+# - lock에 하위 의존성까지 모두 고정되어 있으므로 --no-deps로 다시 해석하지 않는다.
+#   (SB3 2.6.0과 torch 2.1.2의 버전 충돌은 overrides.txt 참고)
+# - pip는 베이스 이미지에 포함된 버전을 그대로 쓴다. (버전 미지정 업그레이드 제거)
+COPY fast_unity/requirements.lock /tmp/requirements.lock
+RUN pip install --no-cache-dir --require-hashes --no-deps \
+      --extra-index-url https://download.pytorch.org/whl/cpu \
+      -r /tmp/requirements.lock
 
-RUN pip install --no-deps stable-baselines3==2.6.0
-
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
 COPY fast_unity/app /app/app
 COPY fast_unity/unity  /app/unity
 COPY fast_unity/entrypoint.sh /app/
