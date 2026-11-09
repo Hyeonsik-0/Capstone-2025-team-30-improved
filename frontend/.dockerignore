@@ -1,0 +1,5 @@
+# 호스트에서 설치·빌드한 결과가 이미지 안의 npm ci·빌드 결과를 덮어쓰지 않도록 제외한다. (이슈 #3)
+# .env.production은 Vite 프로덕션 빌드가 읽으므로 제외하지 않는다.
+node_modules
+dist
+npm-debug.log*
