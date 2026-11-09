@@ -1,0 +1,123 @@
+# 재현 가능한 빌드 확인 (이슈 #3)
+# - 모든 이미지를 캐시 없이 빌드한다.
+# - 학습 서버 이미지는 두 번 빌드해 설치 목록이 같은지, lock 파일과 일치하는지 확인한다.
+# - x86 러너에서 Unity 환경이 실제로 뜨는지(handshake) 확인하고 기동 시간을 기록한다.
+# - workflow_dispatch의 ref 입력으로 다른 소스(예: 원본 main)를 같은 방식으로 빌드해 비교할 수 있다.
+name: reproducible-build
+
+on:
+  pull_request:
+    branches: [develop]
+  push:
+    branches: [develop]
+  schedule:
+    - cron: "0 0 * * 1" # 매주 월요일 09:00 KST: 시간이 지나 빌드가 깨지는지 감시
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "빌드할 소스 ref (비우면 현재 브랜치, 원본 비교는 main)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash # -eo pipefail: 파이프 앞 명령의 실패를 놓치지 않는다
+
+concurrency:
+  group: build-${{ github.event_name }}-${{ inputs.ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  node-images:
+    name: 이미지 빌드 (${{ matrix.name }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: api
+            context: backend/api
+            dockerfile: backend/api/Dockerfile
+          - name: signaling
+            context: backend/signaling-server
+            dockerfile: backend/signaling-server/Dockerfile
+          - name: frontend
+            context: frontend
+            dockerfile: frontend/Dockerfile.nginx
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || '' }}
+      - name: 캐시 없이 빌드
+        run: docker build --no-cache -f "${{ matrix.dockerfile }}" "${{ matrix.context }}"
+
+  training-image:
+    name: 학습 서버 이미지 빌드 + Unity 기동 확인
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || '' }}
+
+      - name: Unity 실행 파일의 git 실행 권한 확인
+        run: |
+          for f in backend/fast_unity/unity/envs/*/env.x86_64; do
+            test -x "$f" || { echo "::error::실행 권한 없음: $f"; exit 1; }
+            echo "실행 권한 확인: $f"
+          done
+
+      - name: 1회차 빌드 (캐시 없음)
+        run: docker build --no-cache -t mlagents-gym:first -f backend/fast_unity/Dockerfile backend
+
+      - name: 2회차 빌드 (캐시 없음)
+        run: docker build --no-cache -t mlagents-gym:second -f backend/fast_unity/Dockerfile backend
+
+      - name: 두 빌드의 설치 목록 비교
+        run: |
+          docker run --rm --entrypoint pip mlagents-gym:first freeze > "$RUNNER_TEMP/freeze-first.txt"
+          docker run --rm --entrypoint pip mlagents-gym:second freeze > "$RUNNER_TEMP/freeze-second.txt"
+          diff -u "$RUNNER_TEMP/freeze-first.txt" "$RUNNER_TEMP/freeze-second.txt"
+          echo "두 빌드의 설치 목록 일치 ($(wc -l < "$RUNNER_TEMP/freeze-first.txt")개)"
+
+      - name: 설치 목록과 lock 파일 비교
+        run: python3 .github/scripts/compare_lock.py backend/fast_unity/requirements.lock "$RUNNER_TEMP/freeze-first.txt"
+
+      - name: Unity 기동 확인 (handshake + 첫 reset)
+        timeout-minutes: 10
+        run: |
+          mkdir -p "$RUNNER_TEMP/unity-out"
+          docker run --rm \
+            -v "$PWD/backend/fast_unity/unity/envs:/app/unity/envs" \
+            -v "$PWD/.github/scripts:/ci:ro" \
+            -v "$RUNNER_TEMP/unity-out:/ci-out" \
+            mlagents-gym:first python /ci/unity_smoke.py car 300 | tee "$RUNNER_TEMP/unity-out/smoke.txt"
+
+      - name: 결과 요약
+        if: always()
+        run: |
+          {
+            echo "## 재현 가능한 빌드 결과"
+            echo "- 소스 ref: \`${{ inputs.ref || github.ref }}\` (\`$(git rev-parse --short HEAD)\`)"
+            if [ -f "$RUNNER_TEMP/freeze-first.txt" ]; then
+              echo "- 주요 패키지:"
+              grep -iE '^(torch|stable.baselines3|mlagents.envs|gymnasium|fastapi|openai|uvicorn|numpy)==' "$RUNNER_TEMP/freeze-first.txt" | sed 's/^/  - /'
+            fi
+            if [ -f "$RUNNER_TEMP/unity-out/smoke.txt" ]; then
+              echo "- Unity 기동:"
+              grep '^UNITY_' "$RUNNER_TEMP/unity-out/smoke.txt" | sed 's/^/  - /'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Unity 로그 보관
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: unity-smoke-log
+          path: ${{ runner.temp }}/unity-out/
+          if-no-files-found: ignore
+          retention-days: 14
