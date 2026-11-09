@@ -191,18 +191,18 @@ docker compose up --build
 
 #### 5.3. 빌드 재현성 (보완 작업, 이슈 #3)
 
-같은 소스로 언제 빌드해도 같은 환경이 나오도록 버전을 고정했습니다.
+같은 소스로 다시 빌드했을 때 **Python·Node 의존성이 같은 버전으로 설치되도록** 고정했습니다. 기준 시점은 졸업과제 배포 구성이 완성된 2025-09-30입니다. 이미지가 바이트 단위로 같아지는 것은 아니며, 남는 위험은 아래에 정리했습니다.
 
 | 대상 | 고정 방식 |
 | --- | --- |
-| 학습 서버 Python 의존성 | `backend/fast_unity/requirements.lock` (하위 의존성까지 해시 포함 고정, 2025-09-30 시점 기준) |
+| 학습 서버 Python 의존성 | `backend/fast_unity/requirements.lock` (하위 의존성까지 해시 포함 고정) |
 | 소스 빌드 도구 | `backend/fast_unity/build-requirements.lock` (gym·pettingzoo는 소스 배포판만 있어 설치 중 빌드되므로 setuptools·wheel도 해시 포함 고정) |
-| Node 의존성 | 각 `package-lock.json` + `npm ci` |
+| Node 의존성 | 각 `package-lock.json` + `npm ci` (`.dockerignore`로 호스트의 `node_modules` 유입 차단) |
 | 베이스·서비스 이미지 | 버전 태그 고정 (예: `node:20.19.5-alpine3.22`, `mongo:7.0.23`, `nginx:1.29.1-alpine3.22`) |
 | 학습 서버 플랫폼 | `linux/amd64` (Unity 환경 실행 파일이 x86_64 전용) |
 
-- **알려진 버전 충돌**: SB3 2.6.0은 torch 2.3 이상을 요구하지만, 당시 학습 서버는 torch 2.1.2(CPU)로 동작했습니다. 재현이 목적이므로 `backend/fast_unity/overrides.txt`로 torch 2.1.2를 유지합니다.
-- **lock 재생성**: 최상위 의존성은 `requirements.in`, `build-requirements.in`에서 관리하고, `backend/fast_unity`에서 아래 명령으로 lock을 다시 만듭니다. (`uv` 필요)
+- **알려진 버전 충돌**: SB3 2.6.0은 torch 2.3 이상을 요구하지만, 당시 학습 서버는 torch 2.1.2(CPU)로 동작했습니다. 재현이 목적이므로 `backend/fast_unity/overrides.txt`로 torch 2.1.2를 유지합니다. CI가 이 조합으로 앱 import와 PPO 학습·저장·로드를 확인합니다.
+- **lock 재생성**: 최상위 의존성은 `requirements.in`, `build-requirements.in`에서 관리하고, `backend/fast_unity`에서 아래 명령으로 lock을 다시 만듭니다. lock은 **uv 0.12.20**으로 만들었습니다.
 
   ```bash
   uv pip compile requirements.in --override overrides.txt --torch-backend cpu \
@@ -215,7 +215,19 @@ docker compose up --build
 
   lock 파일 안에 `--index-url`을 넣으면 Dockerfile 명령줄의 PyTorch 저장소 설정이 덮어써지므로 `--emit-index-url`은 쓰지 않습니다.
 
-- **자동 확인**: GitHub Actions(`.github/workflows/build.yml`)가 PR과 매주 1회 전체 이미지를 캐시 없이 빌드하고, 학습 서버 이미지의 설치 목록이 lock과 일치하는지, x86 환경에서 Unity가 실제로 기동하는지 확인합니다.
+- **자동 확인** (`.github/workflows/build.yml`, PR·develop push·매주 1회)
+  - lock 파일이 `requirements.in`·`overrides.txt`에서 그대로 다시 만들어지는지
+  - compose 문법, 빌드하지 않는 서비스 이미지(mongo, cloudflared) 태그가 존재하는지
+  - 모든 Dockerfile이 캐시 없이 빌드되는지
+  - 학습 서버 이미지의 설치 목록이 lock과 일치하는지, 앱 import·SB3 학습이 되는지, x86 환경에서 Unity 환경 3개가 기동하는지
+  - 공개 저장소는 60일간 활동이 없으면 주간 실행이 자동으로 멈추므로, 장기간 감시하려면 Actions 화면에서 다시 활성화해야 합니다.
+
+- **남는 위험** (이번에 고정하지 않은 것)
+  - **apt 패키지**: 학습 서버 이미지에 추가로 설치하는 시스템 패키지(약 220개)는 빌드 시점의 Debian bookworm 저장소에서 받습니다. 버전이 바뀔 수 있고, bookworm 지원이 끝나 저장소가 archive로 옮겨지면 설치가 실패할 수 있습니다. (대안: snapshot.debian.org 고정)
+  - **이미지 태그**: 버전 태그도 다시 push될 수 있습니다. 실제로 `node:20.19.5-alpine3.22`는 2025-10-22에, `node:20.19.5-bookworm-slim`은 2025-11-18에 다시 push되었습니다. (대안: `@sha256:` digest 고정)
+  - **외부 저장소**: torch(CPU 빌드)는 PyTorch 저장소가 계속 제공해야 받을 수 있습니다. 해시가 내용 변조는 막지만 삭제는 막지 못합니다. (대안: 빌드한 이미지를 레지스트리에 digest로 보관)
+  - **소스 빌드 결과물**: gym·pettingzoo는 설치 중 빌드되므로 설치 목록과 버전은 같아도 wheel 파일 자체는 빌드마다 바이트 단위로 다릅니다.
+  - **frontend `Dockerfile`(serve)**: `serve@14.2.5`의 하위 의존성은 고정되지 않습니다. compose는 이 파일 대신 `Dockerfile.nginx`를 씁니다.
 
 ---
 
