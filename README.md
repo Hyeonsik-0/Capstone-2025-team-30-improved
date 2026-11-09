@@ -189,6 +189,29 @@ docker compose up --build
 | OpenAI API 오류     | API 키 미설정 또는 레이트 리밋 초과          | .env 키 확인, 백오프 재시도, 요금제 확인             |
 | 실시간 학습 메트릭 미전송    | SSE 연결 불안정    | 새로고침 후 DB로부터 메트릭 재수신            |
 
+#### 5.3. 빌드 재현성 (보완 작업, 이슈 #3)
+
+같은 소스로 언제 빌드해도 같은 환경이 나오도록 버전을 고정했습니다.
+
+| 대상 | 고정 방식 |
+| --- | --- |
+| 학습 서버 Python 의존성 | `backend/fast_unity/requirements.lock` (하위 의존성까지 해시 포함 고정, 2025-09-30 시점 기준) |
+| Node 의존성 | 각 `package-lock.json` + `npm ci` |
+| 베이스·서비스 이미지 | 버전 태그 고정 (예: `node:20.19.5-alpine3.22`, `mongo:7.0.23`, `nginx:1.29.1-alpine3.22`) |
+| 학습 서버 플랫폼 | `linux/amd64` (Unity 환경 실행 파일이 x86_64 전용) |
+
+- **알려진 버전 충돌**: SB3 2.6.0은 torch 2.3 이상을 요구하지만, 당시 학습 서버는 torch 2.1.2(CPU)로 동작했습니다. 재현이 목적이므로 `backend/fast_unity/overrides.txt`로 torch 2.1.2를 유지합니다.
+- **lock 재생성**: 최상위 의존성은 `requirements.in`에서 관리하고, `backend/fast_unity`에서 아래 명령으로 lock을 다시 만듭니다. (`uv` 필요)
+
+  ```bash
+  uv pip compile requirements.in --override overrides.txt --torch-backend cpu \
+    --python-version 3.10.12 --python-platform x86_64-manylinux_2_28 \
+    --exclude-newer 2025-09-30T15:00:00Z --generate-hashes --emit-index-url \
+    -o requirements.lock
+  ```
+
+- **자동 확인**: GitHub Actions(`.github/workflows/build.yml`)가 PR과 매주 1회 전체 이미지를 캐시 없이 빌드하고, 학습 서버 이미지의 설치 목록이 lock과 일치하는지, x86 환경에서 Unity가 실제로 기동하는지 확인합니다.
+
 ---
 
 ### 6. 소개 자료 및 시연 영상
