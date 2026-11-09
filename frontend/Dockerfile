@@ -1,5 +1,5 @@
 # Frontend Dockerfile - React 앱만 서빙
-FROM node:20-slim
+FROM node:20.19.5-bookworm-slim
 
 WORKDIR /app
 
@@ -17,7 +17,7 @@ ENV VITE_LOG_LEVEL=error
 RUN npm run build:prod
 
 # serve를 사용한 정적 파일 서빙
-RUN npm install -g serve
+RUN npm install -g serve@14.2.5
 
 EXPOSE 3000
 

@@ -1,5 +1,5 @@
 # Stage 1: Build frontend
-FROM node:20-alpine AS builder
+FROM node:20.19.5-alpine3.22 AS builder
 
 WORKDIR /app
 
@@ -13,7 +13,7 @@ ENV VITE_LOG_LEVEL=error
 RUN npm run build:prod
 
 # Stage 2: Nginx로 서빙
-FROM nginx:alpine
+FROM nginx:1.29.1-alpine3.22
 
 # 빌드된 파일을 nginx로 복사
 COPY --from=builder /app/dist /usr/share/nginx/html

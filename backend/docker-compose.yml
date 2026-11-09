@@ -1,7 +1,7 @@
 services:
   # MongoDB 서비스 추가
   mongodb:
-    image: mongo:7.0
+    image: mongo:7.0.23
     container_name: mongodb
     restart: always
     environment:
@@ -13,6 +13,8 @@ services:
 
   # FastAPI 유니티 서비스
   mlagents-gym:
+    # Unity 환경 실행 파일이 x86_64 전용이라 amd64 이미지로만 동작한다 (이슈 #3)
+    platform: linux/amd64
     build: 
       context: .
       dockerfile: fast_unity/Dockerfile
