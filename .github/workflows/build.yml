@@ -1,8 +1,11 @@
 # 재현 가능한 빌드 확인 (이슈 #3)
-# - 모든 이미지를 캐시 없이 빌드한다.
-# - 학습 서버 이미지는 두 번 빌드해 설치 목록이 같은지, lock 파일과 일치하는지 확인한다.
-# - x86 러너에서 Unity 환경이 실제로 뜨는지(handshake) 확인하고 기동 시간을 기록한다.
+# - lock 파일이 requirements.in·overrides.txt에서 그대로 다시 만들어지는지 확인한다.
+# - compose 설정을 검증하고, 빌드하지 않는 서비스 이미지(mongo, cloudflared) 태그가 존재하는지 확인한다.
+# - 모든 Dockerfile을 캐시 없이 빌드한다.
+# - 학습 서버 이미지는 두 번 빌드해 설치 목록이 같은지, lock 파일과 일치하는지 확인하고,
+#   앱 import·SB3 학습, x86 러너에서 Unity 환경 3개의 기동(handshake)을 확인한다.
 # - workflow_dispatch의 ref 입력으로 다른 소스(예: 원본 main)를 같은 방식으로 빌드해 비교할 수 있다.
+#   CI 스크립트는 항상 이 워크플로가 있는 커밋에서 가져온다.
 name: reproducible-build
 
 on:
@@ -11,7 +14,9 @@ on:
   push:
     branches: [develop]
   schedule:
-    - cron: "0 0 * * 1" # 매주 월요일 09:00 KST: 시간이 지나 빌드가 깨지는지 감시
+    # 매주 월요일 09:00 KST: 시간이 지나 빌드가 깨지는지 감시
+    # (공개 저장소는 60일간 활동이 없으면 schedule이 자동 비활성화된다)
+    - cron: "0 0 * * 1"
   workflow_dispatch:
     inputs:
       ref:
@@ -30,7 +35,55 @@ concurrency:
   group: build-${{ github.event_name }}-${{ inputs.ref || github.ref }}
   cancel-in-progress: true
 
+env:
+  # 비교 모드(다른 소스 ref 지정)인지 여부. 셸에는 표현식 대신 환경 변수로 넘긴다.
+  SRC_REF: ${{ inputs.ref || github.ref }}
+  COMPARE_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.ref != '' }}
+
 jobs:
+  lock-drift:
+    name: lock 파일 재생성 일치 확인
+    if: github.event_name != 'workflow_dispatch' || inputs.ref == ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.12.20" # lock을 만든 uv 버전과 맞춘다
+      - name: lock 재생성 후 비교 (헤더의 명령줄 제외)
+        working-directory: backend/fast_unity
+        run: |
+          common=(--python-version 3.10.12 --python-platform x86_64-manylinux_2_28
+                  --exclude-newer 2025-09-30T15:00:00Z --generate-hashes)
+          uv pip compile requirements.in --override overrides.txt --torch-backend cpu "${common[@]}" \
+            -o "$RUNNER_TEMP/requirements.lock"
+          uv pip compile build-requirements.in "${common[@]}" -o "$RUNNER_TEMP/build-requirements.lock"
+          for f in requirements.lock build-requirements.lock; do
+            diff -u <(grep -v '^#    uv pip compile' "$f") <(grep -v '^#    uv pip compile' "$RUNNER_TEMP/$f")
+            echo "$f: requirements.in에서 다시 만든 결과와 일치"
+          done
+
+  compose-config:
+    name: compose 설정·서비스 이미지 태그 확인
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || '' }}
+      - name: compose 문법 검증
+        run: |
+          docker compose -f docker-compose.yml config -q
+          docker compose -f backend/docker-compose.yml config -q
+      - name: 빌드하지 않는 서비스 이미지 태그 존재 확인
+        run: |
+          grep -hE '^\s+image:' docker-compose.yml backend/docker-compose.yml | awk '{print $2}' | sort -u |
+            while read -r img; do
+              docker buildx imagetools inspect "$img" > /dev/null
+              echo "존재 확인: $img"
+            done
+
   node-images:
     name: 이미지 빌드 (${{ matrix.name }})
     runs-on: ubuntu-24.04
@@ -45,26 +98,44 @@ jobs:
           - name: signaling
             context: backend/signaling-server
             dockerfile: backend/signaling-server/Dockerfile
-          - name: frontend
+          - name: frontend-nginx
             context: frontend
             dockerfile: frontend/Dockerfile.nginx
+          - name: frontend-serve
+            context: frontend
+            dockerfile: frontend/Dockerfile
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref || '' }}
       - name: 캐시 없이 빌드
-        run: docker build --no-cache -f "${{ matrix.dockerfile }}" "${{ matrix.context }}"
+        env:
+          DOCKERFILE: ${{ matrix.dockerfile }}
+          CONTEXT: ${{ matrix.context }}
+        run: docker build --no-cache -f "$DOCKERFILE" "$CONTEXT"
 
   training-image:
-    name: 학습 서버 이미지 빌드 + Unity 기동 확인
+    name: 학습 서버 이미지 빌드 + 앱·Unity 동작 확인
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    env:
+      CI_SCRIPTS: ${{ github.workspace }}/.ci/.github/scripts
+      OUT: ${{ github.workspace }}/.ci-out
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: 빌드할 소스 받기
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref || '' }}
+      - name: CI 스크립트 받기 (워크플로 커밋 기준)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci
+          sparse-checkout: .github/scripts
 
       - name: Unity 실행 파일의 git 실행 권한 확인
+        # 비교 모드에서는 원본의 실패 지점(빌드)까지 진행하도록 실패로 멈추지 않는다
+        continue-on-error: ${{ github.event_name == 'workflow_dispatch' && inputs.ref != '' }}
         run: |
           for f in backend/fast_unity/unity/envs/*/env.x86_64; do
             test -x "$f" || { echo "::error::실행 권한 없음: $f"; exit 1; }
@@ -78,48 +149,76 @@ jobs:
         run: docker build --no-cache -t mlagents-gym:second -f backend/fast_unity/Dockerfile backend
 
       - name: 두 빌드의 설치 목록 비교
+        # 같은 러너에서 연속으로 빌드한 결과의 결정성 확인이다. 시간에 따른 변화는
+        # 아래 lock 비교와 주간 schedule, 그리고 보관하는 빌드 기록으로 추적한다.
         run: |
-          docker run --rm --entrypoint pip mlagents-gym:first freeze --all > "$RUNNER_TEMP/freeze-first.txt"
-          docker run --rm --entrypoint pip mlagents-gym:second freeze --all > "$RUNNER_TEMP/freeze-second.txt"
-          diff -u "$RUNNER_TEMP/freeze-first.txt" "$RUNNER_TEMP/freeze-second.txt"
-          echo "두 빌드의 설치 목록 일치 ($(wc -l < "$RUNNER_TEMP/freeze-first.txt")개)"
+          mkdir -p "$OUT"
+          docker run --rm --entrypoint pip mlagents-gym:first freeze --all > "$OUT/pip-freeze.txt"
+          docker run --rm --entrypoint pip mlagents-gym:second freeze --all > "$OUT/pip-freeze-second.txt"
+          diff -u "$OUT/pip-freeze.txt" "$OUT/pip-freeze-second.txt"
+          echo "두 빌드의 설치 목록 일치 ($(wc -l < "$OUT/pip-freeze.txt")개)"
+          docker run --rm --entrypoint dpkg-query mlagents-gym:first -W > "$OUT/dpkg-packages.txt"
 
       - name: 설치 목록과 lock 파일 비교
         run: |
-          python3 .github/scripts/compare_lock.py "$RUNNER_TEMP/freeze-first.txt" \
+          python3 "$CI_SCRIPTS/compare_lock.py" "$OUT/pip-freeze.txt" \
             backend/fast_unity/requirements.lock backend/fast_unity/build-requirements.lock
 
-      - name: Unity 기동 확인 (handshake + 첫 reset)
+      - name: 앱 import + SB3 학습·저장·로드
+        run: |
+          docker run --rm --entrypoint python -v "$CI_SCRIPTS:/ci:ro" mlagents-gym:first \
+            /ci/app_import_check.py | tee "$OUT/app-check.txt"
+
+      - name: Unity 기동 확인 (환경 3개, handshake + 첫 reset)
         timeout-minutes: 10
         run: |
-          mkdir -p "$RUNNER_TEMP/unity-out"
+          for env_name in ball car cnn_car; do
+            docker run --rm \
+              -v "$PWD/backend/fast_unity/unity/envs:/app/unity/envs" \
+              -v "$CI_SCRIPTS:/ci:ro" \
+              -v "$OUT:/ci-out" \
+              mlagents-gym:first python /ci/unity_smoke.py "$env_name" 300 | tee -a "$OUT/smoke.txt"
+          done
+
+      - name: 실행 권한이 빠진 경우 entrypoint 안전망 확인
+        timeout-minutes: 5
+        run: |
+          cp -r backend/fast_unity/unity/envs "$RUNNER_TEMP/envs-noexec"
+          chmod -x "$RUNNER_TEMP"/envs-noexec/*/env.x86_64
           docker run --rm \
-            -v "$PWD/backend/fast_unity/unity/envs:/app/unity/envs" \
-            -v "$PWD/.github/scripts:/ci:ro" \
-            -v "$RUNNER_TEMP/unity-out:/ci-out" \
-            mlagents-gym:first python /ci/unity_smoke.py car 300 | tee "$RUNNER_TEMP/unity-out/smoke.txt"
+            -v "$RUNNER_TEMP/envs-noexec:/app/unity/envs" \
+            -v "$CI_SCRIPTS:/ci:ro" \
+            -v "$OUT:/ci-out" \
+            mlagents-gym:first python /ci/unity_smoke.py car 300 | tee "$OUT/smoke-noexec.txt"
+          grep -q '^UNITY_HANDSHAKE_SECONDS=' "$OUT/smoke-noexec.txt"
+          echo "실행 권한 없이 마운트해도 entrypoint가 권한을 부여해 Unity 기동"
 
       - name: 결과 요약
         if: always()
         run: |
           {
             echo "## 재현 가능한 빌드 결과"
-            echo "- 소스 ref: \`${{ inputs.ref || github.ref }}\` (\`$(git rev-parse --short HEAD)\`)"
-            if [ -f "$RUNNER_TEMP/freeze-first.txt" ]; then
+            echo "- 소스 ref: \`$SRC_REF\` (\`$(git rev-parse --short HEAD)\`), 비교 모드: $COMPARE_MODE"
+            if [ -f "$OUT/pip-freeze.txt" ]; then
               echo "- 주요 패키지:"
-              grep -iE '^(torch|stable.baselines3|mlagents.envs|gymnasium|gym|fastapi|openai|uvicorn|numpy|setuptools)==' "$RUNNER_TEMP/freeze-first.txt" | sed 's/^/  - /'
+              grep -iE '^(torch|stable.baselines3|mlagents.envs|gymnasium|gym|fastapi|openai|uvicorn|numpy|setuptools)==' \
+                "$OUT/pip-freeze.txt" | sed 's/^/  - /' || true
             fi
-            if [ -f "$RUNNER_TEMP/unity-out/smoke.txt" ]; then
+            if [ -f "$OUT/app-check.txt" ]; then
+              echo "- 앱·학습 스택:"
+              sed 's/^/  - /' "$OUT/app-check.txt"
+            fi
+            if [ -f "$OUT/smoke.txt" ]; then
               echo "- Unity 기동:"
-              grep '^UNITY_' "$RUNNER_TEMP/unity-out/smoke.txt" | sed 's/^/  - /'
+              grep '^UNITY_' "$OUT/smoke.txt" | sed 's/^/  - /' || true
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Unity 로그 보관
+      - name: 빌드 기록 보관 (pip·dpkg 설치 목록, Unity 로그)
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: unity-smoke-log
-          path: ${{ runner.temp }}/unity-out/
+          name: training-image-build-record
+          path: ${{ github.workspace }}/.ci-out/
           if-no-files-found: ignore
-          retention-days: 14
+          retention-days: 90

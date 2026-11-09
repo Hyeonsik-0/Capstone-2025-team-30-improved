@@ -19,7 +19,7 @@ env = UnityEnvironment(
     no_graphics=False,
     worker_id=0,
     timeout_wait=timeout_wait,
-    additional_args=["-screen-width", "640", "-screen-height", "360", "-logFile", "/ci-out/unity.log"],
+    additional_args=["-screen-width", "640", "-screen-height", "360", "-logFile", f"/ci-out/unity-{env_name}.log"],
 )
 t1 = time.monotonic()
 env.reset()
