@@ -1,0 +1,8 @@
+# 학습 서버 대역 의존성 (이슈 #7)
+# 실제 학습 서버(backend/fast_unity/requirements.lock)와 같은 버전으로 맞춘다.
+# HTTP 계층은 실제 코드를 그대로 쓰므로, 요청 검증·응답 동작이 버전 차이로 달라지지 않게 하기 위함이다.
+# lock 재생성 명령은 README 참고.
+fastapi==0.116.1
+pydantic==2.11.9
+uvicorn[standard]==0.37.0
+requests==2.32.5

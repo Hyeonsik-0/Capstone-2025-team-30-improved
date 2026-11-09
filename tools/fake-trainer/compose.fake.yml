@@ -1,0 +1,57 @@
+# 학습 서버 대역 구성 (이슈 #7)
+#
+# 루트 docker-compose.yml 위에 덮어써서, 학습 서버(mlagents-gym) 자리에 대역을 띄운다.
+# 서비스 이름·포트(8000)가 같으므로 BFF 설정은 바꾸지 않는다.
+#
+#   docker compose -p rl-fake -f docker-compose.yml -f tools/fake-trainer/compose.fake.yml \
+#     up -d --build mongodb api-server mlagents-gym
+#
+# - 상대 경로는 첫 번째 파일(docker-compose.yml)이 있는 저장소 루트 기준이다.
+# - 프로젝트 이름(-p)을 따로 주고 container_name을 지워, 실제 구성과 컨테이너·볼륨·네트워크가 겹치지 않게 한다.
+# - 측정 시나리오가 호스트에서 접근할 수 있도록 BFF와 대역 포트를 127.0.0.1에만 연다.
+services:
+  mlagents-gym:
+    platform: !reset null
+    container_name: !reset null
+    build: !override
+      context: ./tools/fake-trainer
+      dockerfile: Dockerfile
+      additional_contexts:
+        realapp: ./backend/fast_unity/app
+    # 실제 모델·로그 폴더(저장소 안)에 가짜 파일을 쓰지 않도록 이름 있는 볼륨을 쓴다.
+    volumes: !override
+      - fake_models:/app/models
+      - fake_train_logs:/app/train_logs
+    environment: !override
+      API_SERVER_URL: http://api-server:8080
+    tty: !reset null
+    # 대역은 시그널링 서버(영상)가 필요 없다.
+    depends_on: !reset []
+    ports:
+      - "127.0.0.1:${FAKE_TRAINER_PORT:-18000}:8000"
+
+  api-server:
+    container_name: !reset null
+    # .env 없이도 뜨도록 env.example의 공통 설정 값을 그대로 넣는다.
+    environment: !override
+      MONGODB_URI: mongodb://mongodb:27017
+      MONGODB_DB: rl_dashboard
+      FASTAPI_BASE: http://mlagents-gym:8000
+    ports:
+      - "127.0.0.1:${FAKE_BFF_PORT:-18080}:8080"
+
+  mongodb:
+    container_name: !reset null
+
+  signaling-server:
+    container_name: !reset null
+
+  nginx:
+    container_name: !reset null
+
+  cloudflared:
+    container_name: !reset null
+
+volumes:
+  fake_models:
+  fake_train_logs:

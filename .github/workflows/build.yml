@@ -63,6 +63,15 @@ jobs:
             diff -u <(grep -v '^#    uv pip compile' "$f") <(grep -v '^#    uv pip compile' "$RUNNER_TEMP/$f")
             echo "$f: requirements.in에서 다시 만든 결과와 일치"
           done
+      - name: 학습 서버 대역 lock 재생성 후 비교 (이슈 #7)
+        working-directory: tools/fake-trainer
+        run: |
+          # ARM 개발 서버와 x86 CI에서 모두 쓰므로 플랫폼을 고정하지 않는다(--universal).
+          uv pip compile requirements.in --universal --python-version 3.10.12 \
+            --exclude-newer 2025-09-30T15:00:00Z --generate-hashes -o "$RUNNER_TEMP/fake-requirements.lock"
+          diff -u <(grep -v '^#    uv pip compile' requirements.lock) \
+                  <(grep -v '^#    uv pip compile' "$RUNNER_TEMP/fake-requirements.lock")
+          echo "tools/fake-trainer/requirements.lock: requirements.in에서 다시 만든 결과와 일치"
 
   compose-config:
     name: compose 설정·서비스 이미지 태그 확인
