@@ -10,11 +10,14 @@
 시나리오
   normal       학습 시작 → 지표 → 일시정지·재개 → 완료, 중지, 시뮬레이션 속도
   bff-restart  학습 중 BFF를 N초 내렸다 올렸을 때 유실되는 지표 수 (기준값)
+  bff-freeze   학습 중 BFF가 N초 응답을 멈췄을 때, 대역이 실패로 기록한 지표 중 실제로 저장된 수
   duplicate    같은 지표를 두 번 보냈을 때 BFF 응답과 DB 중복 여부
   faults       학습 루프 멈춤, 학습 스레드 비정상 종료, 제어 명령 지연·실패에 대한 BFF 반응
 
 각 시나리오는 판정(check)과 관찰값(observed)을 함께 출력한다.
-판정은 "대역과 측정 도구가 의도대로 동작하는가"만 본다. BFF의 현재 약점은 관찰값으로만 기록한다.
+- 판정: 대역·측정 도구가 의도대로 동작하는가, 그리고 장애가 없을 때의 정상 흐름과 불변 조건
+  (보완 작업 뒤에도 유지되어야 하므로 회귀 확인으로 쓴다)
+- 관찰값: 장애 상황에서 BFF가 보이는 현재 반응. 보완으로 바뀔 대상이라 판정하지 않고 기록만 한다.
 """
 
 from __future__ import annotations
@@ -203,6 +206,23 @@ def wait_trainer_idle(ctx: Ctx, timeout: float = 30) -> None:
     wait_until(lambda: fake_state(ctx)["current_run_id"] is None, timeout, 0.3, "대역 학습 종료")
 
 
+def cleanup(ctx: Ctx) -> None:
+    """시나리오가 중간에 실패해도 다음 시나리오가 깨끗한 상태에서 시작하게 한다.
+    장애 스위치를 끄고, 남은 학습·추론이 있으면 대역에 직접 중지를 보낸 뒤 끝날 때까지 기다린다."""
+    try:
+        fake_faults(ctx, reset=True)
+        run_id = fake_state(ctx)["current_run_id"]
+        if run_id:
+            http("POST", f"{ctx.fake}/runs/{run_id}:stop")
+            try:
+                wait_trainer_idle(ctx, 30)
+            except TimeoutError:
+                http("POST", f"{ctx.fake}/_fake/crash")
+                wait_trainer_idle(ctx, 10)
+    except Exception as e:
+        print(f"  정리 중 경고: {type(e).__name__}: {e}")
+
+
 # ---------------------------------------------------------------- 시나리오
 
 def scenario_normal(ctx: Ctx) -> dict[str, Any]:
@@ -214,6 +234,8 @@ def scenario_normal(ctx: Ctx) -> dict[str, Any]:
     sse.connected.wait(5)
 
     wait_until(lambda: len(db_timesteps(ctx, run_id)) >= 3, 30, what="지표 3개 저장")
+    # 사이드 채널 기록은 모든 실행이 함께 쓰므로, 이 시점 이후의 명령만 센다.
+    seq_before = max((c["seq"] for c in fake_state(ctx)["side_channel"]), default=0)
     t_pause = time.monotonic()
     pause_resp = http("POST", f"{ctx.bff}/api/runs/{run_id}/pause")
     pause_latency = round(time.monotonic() - t_pause, 3)
@@ -224,7 +246,7 @@ def scenario_normal(ctx: Ctx) -> dict[str, Any]:
     status_while_paused = run_status(ctx, run_id)
     resume_resp = http("POST", f"{ctx.bff}/api/runs/{run_id}/resume")
     speed_resp = http("POST", f"{ctx.bff}/api/runs/{run_id}/sim-speed", {"speed": 3})
-    side_channel = [c["cmd"] for c in fake_state(ctx)["side_channel"]]
+    side_channel = [c["cmd"] for c in fake_state(ctx)["side_channel"] if c["seq"] > seq_before]
 
     wait_finished(ctx, run_id, 60)
     wait_until(lambda: run_status(ctx, run_id) == "COMPLETED", 15, what="COMPLETED 반영")
@@ -292,8 +314,7 @@ def scenario_bff_restart(ctx: Ctx, down_sec: float) -> dict[str, Any]:
     recorder.start()
     wait_until(lambda: ok_metric_count(ctx, run_id) >= 6, 30, what="지표 6개 전송")
 
-    # 비정상 종료처럼 바로 내린다. (--timeout 0: 종료 대기 없이 SIGKILL)
-    # node가 PID 1이라 SIGTERM을 무시하므로, 기본 stop은 10초 동안 계속 요청을 받는다.
+    # BFF가 비정상 종료된 상황을 흉내 내기 위해 종료 대기 없이 바로 내린다. (--timeout 0: 즉시 SIGKILL)
     t_stop = time.monotonic()
     compose(ctx, "stop", "--timeout", "0", "api-server")
     stopped_after = round(time.monotonic() - t_stop, 1)
@@ -316,8 +337,8 @@ def scenario_bff_restart(ctx: Ctx, down_sec: float) -> dict[str, Any]:
     failed_steps = sorted(i["timesteps"] for i in failed)
 
     checks = {
-        "every_metric_attempted_once": sorted(i["timesteps"] for i in metric_items) == sorted(expected),
-        "missing_equals_failed_sends": missing == failed_steps,
+        # 대역이 모든 스텝의 지표를 한 번 이상 보냈는가 (재전송이 생겨도 성립)
+        "every_expected_step_attempted": {i["timesteps"] for i in metric_items} == expected,
         "completion_sent": len(completion_items(ctx, run_id)) == 1,
     }
     return {
@@ -332,9 +353,55 @@ def scenario_bff_restart(ctx: Ctx, down_sec: float) -> dict[str, Any]:
             "failed_results": sorted({str(i["result"]) for i in failed}),
             "db_count": len(db),
             "missing_timesteps": missing,
-            "missing_window_sec": _window(failed),
+            # 현재 구조(재시도 없음)에서는 빠진 스텝과 전송 실패한 스텝이 같아야 한다.
+            "missing_matches_failed_sends": missing == failed_steps,
+            "failed_send_span_sec": _failed_send_span(failed),
             "status_changes": status_changes,
             "final_status": run_status(ctx, run_id),
+        },
+    }
+
+
+def scenario_bff_freeze(ctx: Ctx, freeze_sec: float) -> dict[str, Any]:
+    """BFF가 죽지 않고 응답만 멈춘 상황(프로세스 정지). 대역은 timeout으로 실패를 기록하지만,
+    BFF가 돌아온 뒤 밀린 요청을 처리하면 '응답 없음'이었던 지표가 실제로는 저장된다."""
+    fake_faults(ctx, {"steps_per_sec": 2048}, reset=True)  # n_steps 2048 → 초당 지표 1개
+    n_steps, n_metrics = 2048, 12
+    t_start = time.monotonic()
+    run_id = start_run(ctx, "bff-freeze", "ppo", {"n_steps": n_steps}, n_steps * n_metrics)
+    wait_until(lambda: ok_metric_count(ctx, run_id) >= 3, 30, what="지표 3개 전송")
+    compose(ctx, "pause", "api-server")
+    time.sleep(freeze_sec)
+    compose(ctx, "unpause", "api-server")
+    wait_finished(ctx, run_id, 120)
+    run_duration = round(time.monotonic() - t_start, 1)
+    wait_trainer_idle(ctx)
+    time.sleep(2)
+
+    metric_items = [i for i in fake_sent(ctx, run_id)["items"] if i["kind"] == "metric"]
+    timed_out = [i for i in metric_items if str(i["result"]).startswith("error:")]
+    expected = {n_steps * k for k in range(1, n_metrics + 1)}
+    db = set(db_timesteps(ctx, run_id))
+    checks = {
+        "every_expected_step_attempted": {i["timesteps"] for i in metric_items} == expected,
+        "completion_attempted": len(completion_items(ctx, run_id)) == 1,
+    }
+    return {
+        "checks": checks,
+        "observed": {
+            "run_id": run_id,
+            "freeze_sec": freeze_sec,
+            "metrics_sent": len(metric_items),
+            "metrics_no_response": len(timed_out),
+            "no_response_results": sorted({str(i["result"]) for i in timed_out}),
+            # 대역은 실패로 기록했지만 DB에는 저장된 지표 (응답 없음 ≠ 처리 안 됨)
+            "no_response_but_saved": sorted(i["timesteps"] for i in timed_out if i["timesteps"] in db),
+            "missing_timesteps": sorted(expected - db),
+            "completion_result": [i["result"] for i in completion_items(ctx, run_id)],
+            "final_status": run_status(ctx, run_id),
+            # 지표 전송이 학습 스레드에서 동기로 일어나 timeout 동안 학습도 멈춘다.
+            "run_duration_sec": run_duration,
+            "nominal_duration_sec": n_metrics * n_steps / 2048,
         },
     }
 
@@ -346,7 +413,9 @@ def _bff_up(ctx: Ctx) -> bool:
         return False
 
 
-def _window(items: list[dict[str, Any]]) -> float | None:
+def _failed_send_span(items: list[dict[str, Any]]) -> float | None:
+    """첫 실패 전송부터 마지막 실패 전송까지의 시간. 각 시각은 요청이 끝난 뒤 기록되므로,
+    실제로 BFF에 닿지 못한 구간은 이 값보다 최대 지표 간격 하나만큼 길 수 있다."""
     if not items:
         return None
     from datetime import datetime
@@ -369,10 +438,13 @@ def scenario_duplicate(ctx: Ctx) -> dict[str, Any]:
     db = db_timesteps(ctx, run_id)
     checks = {
         "each_step_sent_twice": all(len(v) == 2 for v in per_step.values()) and len(per_step) == n_metrics,
-        "second_send_409": all(v == [201, 409] for v in per_step.values()),
+        # 불변 조건: 같은 지표가 여러 번 와도 DB에는 한 번만 저장된다. (재전송 보완의 전제)
         "db_no_duplicates": sorted(db) == sorted(set(db)) and len(db) == n_metrics,
     }
-    return {"checks": checks, "observed": {"run_id": run_id, "results_per_step": per_step, "db_count": len(db)}}
+    return {"checks": checks, "observed": {
+        "run_id": run_id, "results_per_step": per_step, "db_count": len(db),
+        "second_send_409": all(v == [201, 409] for v in per_step.values()),
+    }}
 
 
 def scenario_faults(ctx: Ctx) -> dict[str, Any]:
@@ -385,9 +457,9 @@ def scenario_faults(ctx: Ctx) -> dict[str, Any]:
     wait_until(lambda: ok_metric_count(ctx, run_id) >= 3, 30, what="지표 3개")
     fake_faults(ctx, {"stall": True})
     time.sleep(0.5)
-    count_at_stall = len(db_timesteps(ctx, run_id))
+    count_at_stall = ok_metric_count(ctx, run_id)
     time.sleep(8)
-    count_after = len(db_timesteps(ctx, run_id))
+    count_after = ok_metric_count(ctx, run_id)
     status_during_stall = run_status(ctx, run_id)
     stop_resp = http("POST", f"{ctx.bff}/api/runs/{run_id}/stop")
     time.sleep(2)
@@ -424,6 +496,12 @@ def scenario_faults(ctx: Ctx) -> dict[str, Any]:
     run_id = start_run(ctx, "fault-control", "ppo", {"n_steps": n_steps}, n_steps * 100)
     wait_until(lambda: ok_metric_count(ctx, run_id) >= 1, 30, what="지표 1개")
     fake_faults(ctx, {"control": {"pause": {"delay_sec": 3}}})
+    # 대역 자체 확인: 대역에 직접 보내 지연이 적용되는지 본다. (BFF 상태는 건드리지 않음)
+    t0 = time.monotonic()
+    direct_pause = http("POST", f"{ctx.fake}/runs/{run_id}:pause")
+    direct_latency = round(time.monotonic() - t0, 2)
+    must(http("POST", f"{ctx.fake}/runs/{run_id}:resume"))
+    # BFF를 거치면 어떻게 되는지는 관찰값으로 남긴다.
     t0 = time.monotonic()
     pause_resp = http("POST", f"{ctx.bff}/api/runs/{run_id}/pause")
     pause_latency = round(time.monotonic() - t0, 2)
@@ -437,7 +515,7 @@ def scenario_faults(ctx: Ctx) -> dict[str, Any]:
     must(http("POST", f"{ctx.fake}/runs/{run_id}:stop"))
     wait_trainer_idle(ctx, 10)
     fake_faults(ctx, reset=True)
-    out["checks"]["pause_delay_applied"] = pause_latency >= 3
+    out["checks"]["pause_delay_applied_on_fake"] = direct_pause[0] == 200 and direct_latency >= 3
     out["checks"]["resume_fail_keeps_trainer_paused"] = trainer_paused is True
     out["observed"]["control"] = {
         "run_id": run_id, "bff_pause_latency_sec": pause_latency, "bff_pause_response": pause_resp,
@@ -452,11 +530,12 @@ def scenario_faults(ctx: Ctx) -> dict[str, Any]:
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("scenario", choices=["normal", "bff-restart", "duplicate", "faults", "all"])
+    p.add_argument("scenario", choices=["normal", "bff-restart", "bff-freeze", "duplicate", "faults", "all"])
     p.add_argument("--bff", default="http://127.0.0.1:18080")
     p.add_argument("--fake", default="http://127.0.0.1:18000")
     p.add_argument("--project", default="rl-fake", help="docker compose 프로젝트 이름")
     p.add_argument("--down-sec", type=float, default=5.0, help="bff-restart에서 BFF를 내려 둘 시간")
+    p.add_argument("--freeze-sec", type=float, default=5.0, help="bff-freeze에서 BFF를 멈춰 둘 시간")
     p.add_argument("--out", help="결과 JSON을 저장할 경로")
     args = p.parse_args()
     ctx = Ctx(args)
@@ -464,6 +543,7 @@ def main() -> int:
     runners = {
         "normal": lambda: scenario_normal(ctx),
         "bff-restart": lambda: scenario_bff_restart(ctx, args.down_sec),
+        "bff-freeze": lambda: scenario_bff_freeze(ctx, args.freeze_sec),
         "duplicate": lambda: scenario_duplicate(ctx),
         "faults": lambda: scenario_faults(ctx),
     }
@@ -477,6 +557,8 @@ def main() -> int:
             res = runners[name]()
         except Exception as e:
             res = {"error": f"{type(e).__name__}: {e}", "checks": {"completed": False}}
+        finally:
+            cleanup(ctx)
         res["elapsed_sec"] = round(time.monotonic() - t0, 1)
         results[name] = res
         for check, passed in res["checks"].items():
