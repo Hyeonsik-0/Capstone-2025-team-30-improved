@@ -109,6 +109,7 @@ python3 tools/fake-trainer/scenarios/run_scenarios.py all --out /tmp/fake-result
 |---|---|
 | `normal` | 학습 시작 → 지표가 DB·SSE로 전달 → 일시정지·재개·속도 변경 → 완료, 그리고 중지 |
 | `bff-restart` | 학습 중 BFF를 `--down-sec`(기본 5초) 동안 내렸다 올렸을 때, 대역이 보낸 지표 중 DB에 남지 않은 개수와 상태 변화 |
+| `bff-freeze` | 학습 중 BFF가 `--freeze-sec`(기본 5초) 동안 응답만 멈췄을 때(프로세스 정지), 대역이 실패(timeout)로 기록한 지표 중 실제로는 DB에 저장된 개수, 학습이 늦어진 시간 |
 | `duplicate` | 같은 지표를 두 번 보냈을 때 두 번째 응답(409)과 DB 중복 여부 |
 | `faults` | 학습 루프 멈춤, 학습 스레드 비정상 종료, 제어 명령 지연·실패에 대한 BFF 반응 |
 
