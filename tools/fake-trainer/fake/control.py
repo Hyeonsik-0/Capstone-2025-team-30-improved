@@ -53,9 +53,13 @@ def reset_faults() -> dict[str, Any]:
 
 @router.post("/crash")
 def crash() -> dict[str, Any]:
-    """진행 중인 학습 스레드를 완료 신호 없이 종료시킨다."""
-    if not _service().train_states.is_running:
-        raise HTTPException(status_code=409, detail="진행 중인 학습이 없습니다.")
+    """진행 중인 학습 스레드를 완료 신호 없이 종료시킨다.
+
+    학습 루프가 끝난 뒤(모델 저장·완료 신호 전송 중)에는 받지 않는다.
+    받아 두면 쓰이지 않은 요청이 다음 학습을 시작하자마자 종료시키기 때문이다.
+    """
+    if not (_service().train_states.is_running and PROGRESS.snapshot().get("loop_active")):
+        raise HTTPException(status_code=409, detail="진행 중인 학습 루프가 없습니다.")
     FAULTS.request_crash()
     return {"accepted": True}
 

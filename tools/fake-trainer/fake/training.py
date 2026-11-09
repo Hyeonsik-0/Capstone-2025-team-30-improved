@@ -2,6 +2,8 @@
 
 실제 코드의 대응 위치 (README의 대응표 참고)
 - 학습 진입:      unity/train/train_runner.py run_training
+- 환경 생성·init: unity/train/env_factory.py make_env, make_env_inference
+- 로그 CSV:       unity/train_util/logger_callback.py EpisodeCSVCallback
 - 일시정지·중지:  unity/train_util/training_state.py PauseResumeCallback._on_step
 - 지표 전송:      unity/train_util/real_time_log_callback.py StreamTrainMetricsCallback
 - 완료 신호:      unity/train_util/training_state.py PauseResumeCallback._on_training_end
@@ -13,6 +15,7 @@ BFF와 주고받는 요청(주소, 본문 형식, timeout, 실패 처리)은 실
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import random
@@ -86,7 +89,11 @@ def _fake_kvs(algorithm: str, num: int, total: int, interval: int, elapsed: floa
     키 이름은 SB3 2.6.0 소스의 logger.record 호출(ppo.py, a2c.py, dqn.py, sac.py,
     common/base_class.py의 train/learning_rate)과 저장소의 실제 DQN 학습 로그
     (backend/fast_unity/train_logs/teacher_cnn_car_dqn_run1/progress.csv)로 확인했다.
-    train/* 값은 train()이 한 번이라도 돈 뒤에만 남는다.
+    train/* 값은 train()이 한 번이라도 돈 뒤에만 남긴다.
+
+    실제와 다른 점: 실제 콜백은 SB3 로거의 현재 값(name_to_value)을 읽는데, 로거가 주기적으로
+    dump하면서 값을 비우므로 off-policy에서는 전송 시점에 따라 train/*·exploration_rate가 빠질 수 있다.
+    대역은 그런 누락 없이 항상 같은 키를 보낸다. (BFF는 빠진 키를 null로 처리한다)
     """
     p = min(num / max(total, 1), 1.0)
     noise = lambda s: rng.uniform(-s, s)  # noqa: E731
@@ -166,13 +173,21 @@ def _metric_interval(req) -> int:
     return OFF_POLICY_LOG_INTERVAL
 
 
-def _write_fake_artifacts(model_name: str, rows: list[str]) -> None:
-    """실제 서버처럼 학습 종료 시 모델(zip)을, 학습 중 로그(csv)를 남긴다.
-    내용은 가짜이며, 산출물 API(check-all, 다운로드)가 실제와 같게 동작하게 하는 용도다."""
-    MODELS_PATH.mkdir(parents=True, exist_ok=True)
+def _open_fake_csv(model_name: str) -> Path:
+    """unity/train_util/logger_callback.py EpisodeCSVCallback._on_training_start 처럼
+    학습을 시작할 때 로그 CSV를 헤더와 함께 만든다. 학습 중·비정상 종료 후에도 산출물 확인 API가
+    실제와 같이 로그가 있다고 답하게 하는 용도다.
+    (실제는 에피소드마다 한 줄을 쓰지만, 대역에는 에피소드가 없어 지표를 보낼 때마다 한 줄을 쓴다.)"""
     log_dir = LOGS_PATH / model_name
     log_dir.mkdir(parents=True, exist_ok=True)
-    (log_dir / f"{model_name}.csv").write_text("\n".join(rows) + "\n", encoding="utf-8")
+    path = log_dir / f"{model_name}.csv"
+    path.write_text("ts,episode_index,env_index,episode_reward,episode_length,wall_time\n", encoding="utf-8")
+    return path
+
+
+def _save_fake_model(model_name: str) -> None:
+    """PauseResumeCallback._on_training_end 의 model.save 대역. 내용은 가짜다."""
+    MODELS_PATH.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(MODELS_PATH / f"{model_name}.zip", "w") as zf:
         zf.writestr("FAKE_MODEL.txt", "학습 서버 대역이 만든 가짜 모델 파일입니다.\n")
 
@@ -188,14 +203,18 @@ def run_fake_training(req, state, run_id: str, service) -> None:
         base = _api_base()
         metrics_endpoint = f"{base}/training-metrics" if base else None
         rng = random.Random(run_id)
+        PROGRESS.reset(run_id=run_id, num_timesteps=0, target=target, interval=interval,
+                       phase=phase, stalled=False, loop_active=True, finished=False)
+
+        # env_factory.make_env: 환경을 만든 뒤 사이드 채널로 환경 파라미터를 보낸다.
+        service.side_channel.send_command("init", json.dumps(req.envparams, ensure_ascii=False))
+        csv_path = _open_fake_csv(req.model_name)
 
         start = time.time()
         num = 0
         next_metric = interval
         triggered = False
-        csv_rows = ["timesteps,ep_rew_mean"]
-        PROGRESS.set(run_id=run_id, num_timesteps=0, target=target, interval=interval,
-                     phase=phase, stalled=False)
+        episode = 0
 
         while num < target:
             # PauseResumeCallback._on_step: 일시정지 중에는 진행하지 않고, 중지 신호를 확인한다.
@@ -232,7 +251,10 @@ def run_fake_training(req, state, run_id: str, service) -> None:
                 kvs = _fake_kvs(req.algorithm, num, req.total_timesteps, interval,
                                 time.time() - start, req.hyperparams, rng)
                 payload = _build_metrics_payload(run_id, phase, num, kvs)
-                csv_rows.append(f"{num},{kvs['rollout/ep_rew_mean']:.3f}")
+                episode += 1
+                with csv_path.open("a", encoding="utf-8") as f:
+                    f.write(f"{num},{episode},0,{kvs['rollout/ep_rew_mean']:.3f},"
+                            f"{kvs['rollout/ep_len_mean']:.0f},{time.time():.3f}\n")
                 if metrics_endpoint:
                     # 실제와 같이 학습 스레드에서 동기 호출, 실패하면 버린다. (재시도 없음)
                     sends = 2 if FAULTS.get().duplicate_metrics else 1
@@ -241,8 +263,10 @@ def run_fake_training(req, state, run_id: str, service) -> None:
                               run_id, timesteps=num, phase=phase)
                 next_metric += interval
 
+        # 루프가 끝났으므로 이후의 비정상 종료 요청은 받지 않는다. (/_fake/crash가 확인)
+        PROGRESS.set(loop_active=False)
         # PauseResumeCallback._on_training_end: 모델 저장 → 완료 신호 1회
-        _write_fake_artifacts(req.model_name, csv_rows)
+        _save_fake_model(req.model_name)
         if base and run_id:
             status = "STOPPED" if triggered else "COMPLETED"
             _post("experiment-completed", f"{base}/callbacks/{run_id}/experiment-completed",
@@ -250,14 +274,18 @@ def run_fake_training(req, state, run_id: str, service) -> None:
     except FakeCrash as e:
         print(f"[fake] {e}")
     finally:
-        PROGRESS.set(finished=True)
+        # 처리되지 않은 비정상 종료 요청이 다음 학습으로 넘어가지 않게 지운다.
+        FAULTS.consume_crash()
+        PROGRESS.set(loop_active=False, finished=True)
         service.finish_train_callback()
 
 
-def run_fake_inference(req, state, run_id: str) -> None:
+def run_fake_inference(req, state, run_id: str, side_channel) -> None:
     """train_runner.test_model 대역."""
     try:
+        # env_factory.make_env_inference: 환경 생성 후 init 명령 → 모델 로드 순서.
         # 실제 서버는 모델 파일을 불러오지 못하면 예외가 나고, finally에서 완료 신호를 보낸다.
+        side_channel.send_command("init", json.dumps(req.envparams, ensure_ascii=False))
         model_path = MODELS_PATH / f"{req.model_name}.zip"
         if not model_path.exists():
             raise FileNotFoundError(f"모델 파일이 없습니다: {model_path}")

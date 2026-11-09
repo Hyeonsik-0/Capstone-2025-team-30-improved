@@ -5,7 +5,7 @@
 
 실제 UnityService와 같게 둔 것
 - 메서드 이름·인자·반환값, 상태 확인 조건, RuntimeError 메시지
-  (라우트가 예외를 잡지 않으므로 실제와 같이 500으로 응답한다)
+  (응답 코드는 실제 라우트가 정한다: 대부분 예외를 잡지 않아 500, /feedback만 RuntimeError를 400으로 바꾼다)
 - run_in_executor로 학습·추론을 별도 스레드에서 실행하는 방식
 - 학습 종료 시 finish_train_callback으로 상태를 초기화하는 순서
 
@@ -205,7 +205,7 @@ class UnityService:
 
         def task_wrapper():
             try:
-                run_fake_inference(req, self.inference_states, run_id)
+                run_fake_inference(req, self.inference_states, run_id, self.side_channel)
             except Exception as e:
                 print(f"[inference_model][ERROR] 추론 중 예외 발생: {e}")
             finally:

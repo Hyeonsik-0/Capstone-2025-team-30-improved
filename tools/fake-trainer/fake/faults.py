@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import copy
+import itertools
 import threading
 import time
 from collections import Counter, deque
@@ -54,8 +56,9 @@ class FaultState:
             return self._faults
 
     def update(self, patch: dict[str, Any]) -> Faults:
+        """복사본에 먼저 적용해 보고, 전부 유효할 때만 바꾼다. (일부만 적용되는 일을 막는다)"""
         with self._lock:
-            f = self._faults
+            f = copy.deepcopy(self._faults)
             for key, value in patch.items():
                 if key == "control":
                     for action, ctl in value.items():
@@ -74,6 +77,7 @@ class FaultState:
                     setattr(f, key, bool(value))
                 else:
                     raise ValueError(f"알 수 없는 항목: {key}")
+            self._faults = f
             return f
 
     def reset(self) -> Faults:
@@ -136,6 +140,11 @@ class Progress:
         with self._lock:
             self._data.update(data, updated_at=time.time())
 
+    def reset(self, **data: Any) -> None:
+        """새 학습을 시작할 때 이전 학습의 값(finished 등)을 지운다."""
+        with self._lock:
+            self._data = dict(data, updated_at=time.time())
+
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             return dict(self._data)
@@ -147,11 +156,14 @@ class FakeSideChannel:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._commands: deque[dict[str, Any]] = deque(maxlen=50)
+        # 기록이 50개를 넘어 앞부분이 밀려나도 "이 시점 이후의 명령"을 가려낼 수 있게 번호를 붙인다.
+        self._seq = itertools.count(1)
 
     def send_command(self, cmd: str, msg: str) -> None:
         with self._lock:
             self._commands.append(
-                {"cmd": cmd, "msg": msg, "at": datetime.now(timezone.utc).isoformat()}
+                {"seq": next(self._seq), "cmd": cmd, "msg": msg,
+                 "at": datetime.now(timezone.utc).isoformat()}
             )
 
     def recent(self) -> list[dict[str, Any]]:
