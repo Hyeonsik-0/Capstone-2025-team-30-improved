@@ -5,6 +5,7 @@ import threading
 import os
 import requests
 from unity.train_util.sidechannel import RLSideChannel
+from unity.train_util.bff_sender import get_sender
 from typing import Optional, Dict, Any
 from contextlib import contextmanager
 class UnityTrainingState:
@@ -160,15 +161,13 @@ class PauseResumeCallback(BaseCallback):
         base_api_server_url = os.environ.get("API_SERVER_URL")
         if base_api_server_url and self.run_id:
             endpoint = f"{base_api_server_url}/callbacks/{self.run_id}/experiment-completed"
-            try:
-                if self.verbose:
-                    print(f"[PauseResumeCallback] 학습 완료 신호를 보냅니다 -> {endpoint}")
+            if self.verbose:
+                print(f"[PauseResumeCallback] 학습 완료 신호를 보냅니다 -> {endpoint}")
                 
-                # is_stopped 상태에 따라 성공/중단 상태를 body에 담아 전송
-                status_payload = {"status": "STOPPED" if self.triggered else "COMPLETED"}
-                requests.post(endpoint, json=status_payload, timeout=5)
-            except requests.RequestException as e:
-                print(f"[PauseResumeCallback][ERROR] Node.js API 서버로 완료 신호 전송 실패: {e}")
+            # is_stopped 상태에 따라 성공/중단 상태를 body에 담아 전송
+            status_payload = {"status": "STOPPED" if self.triggered else "COMPLETED"}
+            # 지표와 같은 전송 대기열의 끝에 넣는다. 먼저 넣은 지표를 다 보낸 뒤 보내고, 실패하면 다시 보낸다. (이슈 #16)
+            get_sender().send("experiment-completed", endpoint, status_payload, timeout=5, run_id=self.run_id)
 
         # 로컬 상태 리셋
         try:
