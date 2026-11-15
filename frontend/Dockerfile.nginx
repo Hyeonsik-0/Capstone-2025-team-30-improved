@@ -10,6 +10,8 @@ RUN npm ci
 # 소스 코드 복사 및 빌드
 COPY . .
 ENV VITE_LOG_LEVEL=error
+# 측정용 빌드 옵션 (이슈 #9). true일 때만 실험 상태 저장소를 window에 노출한다. 기본값은 비움(노출하지 않음).
+ARG VITE_E2E_EXPOSE_STORE=
 RUN npm run build:prod
 
 # Stage 2: Nginx로 서빙

@@ -16,6 +16,11 @@ export default defineConfig(({ mode }) => {
         }
       })
     ],
+    define: {
+      // 측정용 빌드 옵션 (tools/browser-e2e, 이슈 #9). 켠 빌드에서만 실험 상태 저장소를 window에 노출한다.
+      // 빌드할 때 상수로 바뀌므로, 끈 빌드(기본값)에서는 노출 코드가 결과물에서 빠진다.
+      __E2E_EXPOSE_STORE__: JSON.stringify(env.VITE_E2E_EXPOSE_STORE === 'true'),
+    },
     resolve: {
       alias: {
         '@': path.resolve(__dirname, './src')
