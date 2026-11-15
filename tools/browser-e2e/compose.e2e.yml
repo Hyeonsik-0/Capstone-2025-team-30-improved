@@ -8,8 +8,9 @@
 #   mkdir -p tools/browser-e2e/out
 #   $E2E run --rm --build --user "$(id -u):$(id -g)" browser-e2e all --out /out/results.json
 #
-# 요청 경로: 브라우저(browser-e2e) → toxiproxy:8080 → nginx:80 → api-server:8080
-# - 장애는 브라우저와 nginx 사이에만 넣는다. 학습 서버 대역 → BFF → DB 경로는 건드리지 않는다.
+# 요청 경로: 대시보드 페이지 → toxiproxy:8080 → nginx:80 → api-server:8080 (/ws는 signaling-server)
+#           가짜 Unity 송출기 페이지 → toxiproxy:8081 → signaling-server:80 (이슈 #18)
+# - 장애는 브라우저–nginx 사이와 가짜 Unity–시그널링 서버 사이에만 넣는다. 학습 서버 대역 → BFF → DB 경로는 건드리지 않는다.
 # - 웹 확인용 구성(rl-fake)과 프로젝트 이름을 나눠(-p rl-e2e), 측정용으로 빌드한 nginx 이미지가 섞이지 않게 한다.
 services:
   nginx:
