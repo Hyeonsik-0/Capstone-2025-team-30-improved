@@ -495,9 +495,22 @@ export const changeSimSpeedHandler = async (req: Request, res: Response) => {
 };
 
 // runId별 TrainingMetric 목록 조회 핸들러
+// 쿼리 afterTimesteps(선택, 0 이상의 정수): 이 스텝보다 큰 지표만 돌려준다.
+// SSE가 다시 연결될 때 끊긴 구간을 DB에서 채우는 용도다. (이슈 #10)
+// 주면 metrics·chartData·total·currentProgress는 돌려준 구간 기준이고, 없으면 응답은 이전과 같다.
 export const getRunTrainingMetricsHandler = async (req: Request, res: Response) => {
   const runId = validateId(req, res);
   if (!runId) return;
+
+  const afterRaw = req.query.afterTimesteps;
+  let afterTimesteps: number | undefined;
+  if (afterRaw !== undefined) {
+    if (typeof afterRaw !== 'string' || !/^\d+$/.test(afterRaw) || !Number.isSafeInteger(Number(afterRaw))) {
+      sendErrorResponse(res, 400, 'Invalid afterTimesteps');
+      return;
+    }
+    afterTimesteps = Number(afterRaw);
+  }
 
   try {
     // Run 정보 조회 (알고리즘 및 총 스텝 수)
@@ -507,8 +520,11 @@ export const getRunTrainingMetricsHandler = async (req: Request, res: Response) 
       return;
     }
 
-    // 모든 TrainingMetric 데이터 조회 (스텝 순서대로 정렬)
-    const metrics = await TrainingMetricModel.find({ runId })
+    // TrainingMetric 데이터 조회 (스텝 순서대로 정렬). (runId, timesteps) 인덱스를 쓴다.
+    const filter = afterTimesteps === undefined
+      ? { runId }
+      : { runId, timesteps: { $gt: afterTimesteps } };
+    const metrics = await TrainingMetricModel.find(filter)
       .sort({ timesteps: 1 }) // 스텝 번호 순으로 정렬
       .lean();
 
@@ -533,9 +549,10 @@ export const getRunTrainingMetricsHandler = async (req: Request, res: Response) 
       chartData // 차트용 데이터
     };
 
-    logInfo("Get Run Training Metrics", "Successfully fetched training metrics", { 
-      runId, 
-      metricsCount: metrics.length 
+    logInfo("Get Run Training Metrics", "Successfully fetched training metrics", {
+      runId,
+      afterTimesteps,
+      metricsCount: metrics.length
     });
     
     sendSuccessResponse(res, responseData);
