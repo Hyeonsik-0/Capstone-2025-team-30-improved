@@ -1,0 +1,65 @@
+# 브라우저 측정 시나리오 (이슈 #9)
+# - 학습 서버 대역 구성 위에 측정용으로 빌드한 웹(nginx)과 Toxiproxy를 띄운다.
+#   Playwright로 대시보드를 열어, 브라우저–nginx 사이 장애가 실시간 차트에 남기는 영향을 잰다.
+# - 결과 JSON, 시나리오별 SSE 연결 기록과 브라우저 콘솔, 컨테이너 로그를 아티팩트로 남긴다.
+name: browser-e2e
+
+on:
+  pull_request:
+    branches: [develop]
+  push:
+    branches: [develop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: browser-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  E2E: docker compose -p rl-e2e -f docker-compose.yml -f tools/fake-trainer/compose.fake.yml -f tools/browser-e2e/compose.e2e.yml
+
+jobs:
+  scenarios:
+    name: 측정용 웹 + Toxiproxy 기동, 브라우저 측정 시나리오
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: 구성 기동
+        run: |
+          docker compose version
+          $E2E up -d --build --wait mongodb api-server mlagents-gym signaling-server nginx toxiproxy
+          $E2E --profile e2e build browser-e2e
+
+      - name: 측정 시나리오 실행
+        run: |
+          mkdir -p ci-out
+          E2E_OUT_DIR="$PWD/ci-out" $E2E run --rm --user "$(id -u):$(id -g)" \
+            browser-e2e all --out /out/browser-e2e-results.json
+
+      - name: 컨테이너 로그 저장
+        if: always()
+        run: |
+          mkdir -p ci-out
+          for s in mongodb api-server mlagents-gym nginx toxiproxy; do
+            $E2E logs --no-color "$s" > "ci-out/$s.log" 2>&1 || true
+          done
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: browser-e2e-scenarios
+          path: ci-out/
+          retention-days: 30
+
+      - name: 정리
+        if: always()
+        run: $E2E down -v || true

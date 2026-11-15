@@ -1,0 +1,4 @@
+# 브라우저 측정 컨테이너의 Python 의존성 (이슈 #9)
+# 버전은 기반 이미지(mcr.microsoft.com/playwright/python:v1.64.1-noble)에 들어 있는 브라우저 버전과 같아야 한다.
+# 이미지 태그를 바꾸면 이 버전과 lock도 같이 바꾼다. lock 재생성 명령은 README.md 참고.
+playwright==1.64.1

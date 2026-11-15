@@ -1,0 +1,52 @@
+# 브라우저 측정 구성 (이슈 #9)
+#
+# 학습 서버 대역 구성(tools/fake-trainer/compose.fake.yml) 위에 덮어써서
+# 측정용으로 빌드한 웹(nginx), 브라우저–nginx 사이에 장애를 넣는 Toxiproxy, Playwright 측정 컨테이너를 더한다.
+#
+#   E2E="docker compose -p rl-e2e -f docker-compose.yml -f tools/fake-trainer/compose.fake.yml -f tools/browser-e2e/compose.e2e.yml"
+#   $E2E up -d --build --wait mongodb api-server mlagents-gym signaling-server nginx toxiproxy
+#   mkdir -p tools/browser-e2e/out
+#   $E2E run --rm --build --user "$(id -u):$(id -g)" browser-e2e all --out /out/results.json
+#
+# 요청 경로: 브라우저(browser-e2e) → toxiproxy:8080 → nginx:80 → api-server:8080
+# - 장애는 브라우저와 nginx 사이에만 넣는다. 학습 서버 대역 → BFF → DB 경로는 건드리지 않는다.
+# - 웹 확인용 구성(rl-fake)과 프로젝트 이름을 나눠(-p rl-e2e), 측정용으로 빌드한 nginx 이미지가 섞이지 않게 한다.
+services:
+  nginx:
+    build:
+      args:
+        VITE_E2E_EXPOSE_STORE: "true"
+    # 기본 compose는 80/443을 모든 인터페이스에 연다. 측정 구성은 로컬에서만 연다.
+    ports: !override
+      - "127.0.0.1:${E2E_WEB_PORT:-18081}:80"
+    # nginx.conf의 upstream이 mlagents-gym 이름을 기동 시점에 찾으므로 대역이 먼저 떠 있어야 한다.
+    depends_on:
+      - mlagents-gym
+
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.13.0@sha256:5d3dae09bc185dcc5ff6cf43abf6062a4a720aff0c4306a471e773acdcd107aa
+    # 프록시(web: 0.0.0.0:8080 → nginx:80)는 측정 스크립트가 API(8474)로 만든다.
+    networks:
+      - unity-network
+    depends_on:
+      - nginx
+
+  browser-e2e:
+    # Playwright 공식 이미지 + 버전을 맞춘 Python 패키지 (Dockerfile, requirements.lock)
+    build: ./tools/browser-e2e
+    # up으로는 띄우지 않고 run으로만 실행한다.
+    profiles: ["e2e"]
+    working_dir: /repo
+    entrypoint: ["python3", "tools/browser-e2e/run_e2e.py"]
+    environment:
+      HOME: /tmp
+    volumes:
+      - ./tools:/repo/tools:ro
+      - ${E2E_OUT_DIR:-./tools/browser-e2e/out}:/out
+    # Chromium은 /dev/shm 기본값(64MB)에서 탭이 죽을 수 있다.
+    shm_size: 1gb
+    init: true
+    networks:
+      - unity-network
+    depends_on:
+      - toxiproxy
