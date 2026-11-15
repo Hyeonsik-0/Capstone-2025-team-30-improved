@@ -232,8 +232,11 @@ def run_case(cfg: Cfg, browser: Browser, name: str, *, metrics_per_sec: int, n_m
             t0 = now_ms()
             inject(cfg, kind)
             page.wait_for_timeout(sec * 1000)
+            # 장애 구간의 끝은 복구 요청 직전 시각이다. 복구 동작이 연결을 닫는 경우(timeout toxic 제거)
+            # 그 오류가 '장애 중 브라우저의 반응'으로 잡히지 않게 한다.
+            t1 = now_ms()
             recover(cfg, kind)
-            window = (t0, now_ms())
+            window = (t0, t1)
 
         rs.wait_finished(ctx, run_id, n_metrics / metrics_per_sec + 90)
         rs.wait_trainer_idle(ctx)
