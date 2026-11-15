@@ -56,8 +56,12 @@ export function MetricLineChart({
       <ResponsiveContainer width="100%" height="100%">
         <LineChart margin={{ top: 10, right: 24, bottom: 28, left: 56 }}>
           <CartesianGrid strokeDasharray="3 3" stroke="#e0e0e0" />
+          {/* 스텝을 숫자 축으로 그려, 빠진 스텝이 간격으로 드러나게 한다. (이슈 #10) */}
           <XAxis 
             dataKey="x" 
+            type="number"
+            domain={['dataMin', 'dataMax']}
+            allowDecimals={false}
             tickMargin={8}
             stroke="#666"
             fontSize={12}
@@ -93,6 +97,8 @@ export function MetricLineChart({
               dot={false}
               activeDot={{ r: 4, stroke: line.stroke, strokeWidth: 2, fill: '#fff' }}
               connectNulls={true}
+              // 실시간으로 계속 바뀌는 데이터라 애니메이션을 끈다. (병합으로 중간 스텝이 채워질 때 선이 흔들리지 않게)
+              isAnimationActive={false}
             />
           ))}
         </LineChart>

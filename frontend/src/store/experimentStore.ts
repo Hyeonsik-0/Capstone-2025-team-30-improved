@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 
 
-interface TrainingDataPoint {
+export interface TrainingDataPoint {
   timesteps: number;
   reward?: number;
   loss?: number;
@@ -79,6 +79,8 @@ interface ExperimentState {
   // 스트리밍 헬퍼
   resetTrainingMetrics: () => void;
   appendTrainingMetric: (data: { timesteps: number; chartMetrics: any }) => void;
+  /** 스텝 기준으로 병합한다 (SSE 수신, 재연결 때 DB 채우기, 페이지 진입 복원 공통) */
+  mergeTrainingMetrics: (points: TrainingDataPoint[]) => void;
 
   /* ===== 실시간 메트릭 관련 ===== */
   // SSE 연결은 StreamingManager에서 직접 관리
@@ -129,6 +131,35 @@ interface ExperimentState {
     metricsData: any;
   }) => void;
   clearSelectedComparisons: () => void;
+}
+
+/**
+ * 지표 하나를 차트 데이터 형식으로 바꾼다. (BFF가 표준화한 chartMetrics를 그대로 쓰고, undefined는 null로)
+ */
+export function toChartPoint(timesteps: number, chartMetrics: Record<string, unknown> | undefined): TrainingDataPoint {
+  const cleaned = Object.fromEntries(
+    Object.entries(chartMetrics || {}).map(([key, value]) => [key, value === undefined ? null : value])
+  );
+  return { timesteps, ...cleaned };
+}
+
+/**
+ * 스텝(timesteps)을 키로 병합한다. 같은 스텝은 새 값으로 바꾸고, 결과는 스텝 순으로 정렬한다. (이슈 #10)
+ * SSE 수신, 재연결 때 DB 채우기, 페이지 진입 복원이 모두 이 함수를 거치므로,
+ * 응답이 어떤 순서로 도착해도 빠지거나 겹치는 스텝이 생기지 않는다.
+ * (한 실험의 지표는 phase가 하나라서 스텝마다 지표가 하나다)
+ */
+export function mergeByTimesteps(current: TrainingDataPoint[], incoming: TrainingDataPoint[]): TrainingDataPoint[] {
+  if (incoming.length === 0) return current;
+  // 흔한 경우: 마지막 스텝보다 큰 지표 하나가 뒤에 붙는다. (current는 항상 정렬되어 있다)
+  const last = current.length > 0 ? current[current.length - 1].timesteps : -Infinity;
+  if (incoming.length === 1 && incoming[0].timesteps > last) {
+    return [...current, incoming[0]];
+  }
+  const byStep = new Map<number, TrainingDataPoint>();
+  for (const point of current) byStep.set(point.timesteps, point);
+  for (const point of incoming) byStep.set(point.timesteps, point);
+  return [...byStep.values()].sort((a, b) => a.timesteps - b.timesteps);
 }
 
 export const useExperimentStore = create<ExperimentState>((set) => ({
@@ -196,31 +227,15 @@ export const useExperimentStore = create<ExperimentState>((set) => ({
   resetTrainingMetrics: () => set({ trainingMetrics: [] }),
 
   appendTrainingMetric: (data: { timesteps: number; chartMetrics: any }) => {
-    const { timesteps, chartMetrics } = data;
-    
-    console.log('🔍 experimentStore - received data:', data);
-    console.log('📊 experimentStore - chartMetrics:', chartMetrics);
-    
-    // chartMetrics를 그대로 사용 (백엔드에서 이미 표준화됨)
-    // undefined 값들을 null로 변환
-    const cleanedMetrics = Object.fromEntries(
-      Object.entries(chartMetrics || {}).map(([key, value]) => [
-        key, 
-        value === undefined ? null : value
-      ])
-    );
-    
-    const metricsObj: any = { 
-      timesteps,
-      ...cleanedMetrics
-    };
-    
-    console.log('✅ experimentStore - metricsObj:', metricsObj);
-
+    const point = toChartPoint(data.timesteps, data.chartMetrics);
     set(state => ({
-      trainingMetrics: [...state.trainingMetrics, metricsObj]
+      trainingMetrics: mergeByTimesteps(state.trainingMetrics, [point])
     }));
   },
+
+  mergeTrainingMetrics: (points) => set(state => ({
+    trainingMetrics: mergeByTimesteps(state.trainingMetrics, points)
+  })),
 
 
   /* ===== 비디오 플레이어 관련 ===== */
