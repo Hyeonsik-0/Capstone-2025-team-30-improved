@@ -1,10 +1,12 @@
 # 학습 서버 대역 이미지 (이슈 #7)
 #
-# 빌드에는 두 개의 컨텍스트가 필요하다.
+# 빌드에는 세 개의 컨텍스트가 필요하다.
 #   - 기본 컨텍스트: tools/fake-trainer (대역 코드)
 #   - realapp:       backend/fast_unity/app (실제 학습 서버의 HTTP 계층)
-# compose 오버라이드(compose.fake.yml)가 둘 다 지정한다. 직접 빌드할 때:
-#   docker build --build-context realapp=backend/fast_unity/app -t rl-fake-trainer tools/fake-trainer
+#   - realsender:    backend/fast_unity/unity/train_util (실제 BFF 전송 대기열, 이슈 #16)
+# compose 오버라이드(compose.fake.yml)가 모두 지정한다. 직접 빌드할 때:
+#   docker build --build-context realapp=backend/fast_unity/app \
+#     --build-context realsender=backend/fast_unity/unity/train_util -t rl-fake-trainer tools/fake-trainer
 #
 # 실제 학습 서버와 같은 Python 버전을 쓴다. Unity·Xvfb·VNC가 없으므로 시스템 패키지는 설치하지 않는다.
 FROM python:3.10.12-slim
@@ -21,6 +23,8 @@ COPY --from=realapp . /app/app
 # 2) Unity·SB3가 필요한 서비스 계층만 대역 구현으로 덮어쓴다.
 COPY unity_service.py /app/app/services/unity_service.py
 COPY fake /app/fake
+# 3) BFF로 보내는 지표·완료 신호의 전송 대기열은 실제 파일을 그대로 쓴다.
+COPY --from=realsender bff_sender.py /app/fake/bff_sender.py
 # 로컬에서 생긴 바이트코드 캐시가 섞이지 않게 지운다.
 RUN find /app -name __pycache__ -type d -prune -exec rm -rf {} + \
  && mkdir -p /app/models /app/train_logs

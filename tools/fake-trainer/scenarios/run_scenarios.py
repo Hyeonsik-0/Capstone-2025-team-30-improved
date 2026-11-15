@@ -11,6 +11,7 @@
   normal       학습 시작 → 지표 → 일시정지·재개 → 완료, 중지, 시뮬레이션 속도
   bff-restart  학습 중 BFF를 N초 내렸다 올렸을 때 유실되는 지표 수 (기준값)
   bff-freeze   학습 중 BFF가 N초 응답을 멈췄을 때, 대역이 실패로 기록한 지표 중 실제로 저장된 수
+  bff-down-at-end  학습이 끝날 때 BFF가 내려가 있으면 마지막 지표와 완료 신호가 도착하는지 (이슈 #16)
   duplicate    같은 지표를 두 번 보냈을 때 BFF 응답과 DB 중복 여부
   faults       학습 루프 멈춤, 학습 스레드 비정상 종료, 제어 명령 지연·실패에 대한 BFF 반응
 
@@ -206,6 +207,36 @@ def wait_trainer_idle(ctx: Ctx, timeout: float = 30) -> None:
     wait_until(lambda: fake_state(ctx)["current_run_id"] is None, timeout, 0.3, "대역 학습 종료")
 
 
+def wait_sender_idle(ctx: Ctx, timeout: float = 60) -> None:
+    """대역의 BFF 전송 대기열이 빌 때까지 기다린다. (이슈 #16 이전 대역에는 대기열이 없다)"""
+    def idle() -> bool:
+        sender = fake_state(ctx).get("sender")
+        return sender is None or sender["pending"] == 0
+    wait_until(idle, timeout, 0.5, "전송 대기열 비움")
+
+
+SAVED = (201, 409)  # BFF가 지표를 저장했거나 이미 저장되어 있음
+
+
+def _at(item: dict[str, Any]) -> float:
+    from datetime import datetime
+    return datetime.fromisoformat(item["at"]).timestamp()
+
+
+def completion_after_last_metric(items: list[dict[str, Any]]) -> bool | None:
+    """성공한 완료 신호가 마지막으로 저장된 지표보다 뒤에 도착했는가. 완료 신호가 성공하지 못했으면 None."""
+    done = [_at(i) for i in items if i["kind"] == "experiment-completed" and i["result"] == 200]
+    saved = [_at(i) for i in items if i["kind"] == "metric" and i["result"] in SAVED]
+    if not done:
+        return None
+    return not saved or min(done) > max(saved)
+
+
+def db_duplicates(ctx: Ctx, run_id: str) -> int:
+    db = db_timesteps(ctx, run_id)
+    return len(db) - len(set(db))
+
+
 def cleanup(ctx: Ctx) -> None:
     """시나리오가 중간에 실패해도 다음 시나리오가 깨끗한 상태에서 시작하게 한다.
     장애 스위치를 끄고, 남은 학습·추론이 있으면 대역에 직접 중지를 보낸 뒤 끝날 때까지 기다린다."""
@@ -219,6 +250,8 @@ def cleanup(ctx: Ctx) -> None:
             except TimeoutError:
                 http("POST", f"{ctx.fake}/_fake/crash")
                 wait_trainer_idle(ctx, 10)
+        # 남은 재전송이 다음 시나리오의 전송 앞을 막지 않게 한다.
+        wait_sender_idle(ctx)
     except Exception as e:
         print(f"  정리 중 경고: {type(e).__name__}: {e}")
 
@@ -353,9 +386,12 @@ def scenario_bff_restart(ctx: Ctx, down_sec: float) -> dict[str, Any]:
             "failed_results": sorted({str(i["result"]) for i in failed}),
             "db_count": len(db),
             "missing_timesteps": missing,
-            # 현재 구조(재시도 없음)에서는 빠진 스텝과 전송 실패한 스텝이 같아야 한다.
+            "db_duplicates": db_duplicates(ctx, run_id),
+            # 재전송이 없으면 전송에 실패한 스텝이 그대로 빠진다. 재전송이 있으면 실패한 스텝도 결국 저장된다.
             "missing_matches_failed_sends": missing == failed_steps,
+            "failed_steps_saved_later": len(set(failed_steps) & db),
             "failed_send_span_sec": _failed_send_span(failed),
+            "completion_after_last_metric": completion_after_last_metric(sent["items"]),
             "status_changes": status_changes,
             "final_status": run_status(ctx, run_id),
         },
@@ -397,11 +433,75 @@ def scenario_bff_freeze(ctx: Ctx, freeze_sec: float) -> dict[str, Any]:
             # 대역은 실패로 기록했지만 DB에는 저장된 지표 (응답 없음 ≠ 처리 안 됨)
             "no_response_but_saved": sorted(i["timesteps"] for i in timed_out if i["timesteps"] in db),
             "missing_timesteps": sorted(expected - db),
+            "db_duplicates": db_duplicates(ctx, run_id),
             "completion_result": [i["result"] for i in completion_items(ctx, run_id)],
             "final_status": run_status(ctx, run_id),
-            # 지표 전송이 학습 스레드에서 동기로 일어나 timeout 동안 학습도 멈춘다.
+            # 전송이 학습 스레드에서 동기로 일어나면 timeout 동안 학습도 멈춰 nominal보다 길어진다.
             "run_duration_sec": run_duration,
             "nominal_duration_sec": n_metrics * n_steps / 2048,
+        },
+    }
+
+
+def scenario_bff_down_at_end(ctx: Ctx, down_sec: float) -> dict[str, Any]:
+    """학습이 끝날 때 BFF가 내려가 있는 상황 (이슈 #16).
+    마지막 지표 몇 개와 완료 신호를 보내야 할 때 BFF가 없다. BFF가 돌아온 뒤 이것들이 도착하는지,
+    완료 신호가 마지막 지표보다 뒤에 오는지 본다."""
+    fake_faults(ctx, {"steps_per_sec": 4096}, reset=True)  # n_steps 2048 → 초당 지표 2개
+    n_steps, n_metrics, before_stop = 2048, 20, 16
+    run_id = start_run(ctx, "bff-down-at-end", "ppo", {"n_steps": n_steps}, n_steps * n_metrics)
+    recorder = StatusRecorder(ctx, run_id)
+    recorder.start()
+    wait_until(lambda: ok_metric_count(ctx, run_id) >= before_stop, 30, what=f"지표 {before_stop}개 전송")
+
+    t_stop = time.monotonic()
+    compose(ctx, "stop", "--timeout", "0", "api-server")
+    # 대역 학습 루프가 끝나(남은 지표와 완료 신호를 보낼 시점이 지나) 다시 down_sec 동안 BFF를 내려 둔다.
+    wait_until(lambda: fake_state(ctx)["progress"].get("finished"), 30, 0.2, "대역 학습 종료")
+    trainer_finished_after = round(time.monotonic() - t_stop, 1)
+    time.sleep(down_sec)
+    compose(ctx, "start", "api-server")
+    wait_until(lambda: _bff_up(ctx), 60, 0.2, "BFF 재기동")
+    t_up = time.monotonic()
+    bff_down_total = round(t_up - t_stop, 1)
+
+    # 완료 신호가 성공할 때까지 기다린다. 재전송이 없으면 오지 않으므로 제한 시간까지만 기다린다.
+    def completion_ok() -> bool:
+        return any(i["result"] == 200 for i in completion_items(ctx, run_id))
+    try:
+        wait_until(completion_ok, 60, 0.5, "완료 신호 200")
+        completion_delivered_after_up = round(time.monotonic() - t_up, 1)
+    except TimeoutError:
+        completion_delivered_after_up = None
+    time.sleep(1)
+    status_changes = recorder.stop()
+
+    sent = fake_sent(ctx, run_id)
+    metric_items = [i for i in sent["items"] if i["kind"] == "metric"]
+    failed = [i for i in metric_items if i["result"] not in SAVED]
+    expected = {n_steps * k for k in range(1, n_metrics + 1)}
+    db = set(db_timesteps(ctx, run_id))
+    checks = {
+        "every_expected_step_attempted": {i["timesteps"] for i in metric_items} == expected,
+        # 측정 도구 확인: BFF를 내린 동안 실제로 전송 실패가 생겼는가 (장애가 의도한 시점에 들어갔는가)
+        "sends_failed_while_bff_down": len(failed) > 0,
+    }
+    return {
+        "checks": checks,
+        "observed": {
+            "run_id": run_id,
+            "down_sec_after_trainer_finished": down_sec,
+            "trainer_finished_after_stop_sec": trainer_finished_after,
+            "bff_unreachable_total_sec": bff_down_total,
+            "metrics_failed_attempts": len(failed),
+            "db_count": len(db),
+            "missing_timesteps": sorted(expected - db),
+            "db_duplicates": db_duplicates(ctx, run_id),
+            "completion_results": [i["result"] for i in completion_items(ctx, run_id)],
+            "completion_delivered_after_bff_up_sec": completion_delivered_after_up,
+            "completion_after_last_metric": completion_after_last_metric(sent["items"]),
+            "status_changes": status_changes,
+            "final_status": run_status(ctx, run_id),
         },
     }
 
@@ -530,12 +630,15 @@ def scenario_faults(ctx: Ctx) -> dict[str, Any]:
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("scenario", choices=["normal", "bff-restart", "bff-freeze", "duplicate", "faults", "all"])
+    p.add_argument("scenario", choices=["normal", "bff-restart", "bff-freeze", "bff-down-at-end",
+                                        "duplicate", "faults", "all"])
     p.add_argument("--bff", default="http://127.0.0.1:18080")
     p.add_argument("--fake", default="http://127.0.0.1:18000")
     p.add_argument("--project", default="rl-fake", help="docker compose 프로젝트 이름")
     p.add_argument("--down-sec", type=float, default=5.0, help="bff-restart에서 BFF를 내려 둘 시간")
     p.add_argument("--freeze-sec", type=float, default=5.0, help="bff-freeze에서 BFF를 멈춰 둘 시간")
+    p.add_argument("--end-down-sec", type=float, default=5.0,
+                   help="bff-down-at-end에서 학습이 끝난 뒤 BFF를 더 내려 둘 시간")
     p.add_argument("--out", help="결과 JSON을 저장할 경로")
     args = p.parse_args()
     ctx = Ctx(args)
@@ -544,6 +647,7 @@ def main() -> int:
         "normal": lambda: scenario_normal(ctx),
         "bff-restart": lambda: scenario_bff_restart(ctx, args.down_sec),
         "bff-freeze": lambda: scenario_bff_freeze(ctx, args.freeze_sec),
+        "bff-down-at-end": lambda: scenario_bff_down_at_end(ctx, args.end_down_sec),
         "duplicate": lambda: scenario_duplicate(ctx),
         "faults": lambda: scenario_faults(ctx),
     }

@@ -16,10 +16,12 @@
 │   ├── schemas/training.py  실제 (요청 검증)
 │   └── services/unity_service.py  ← 대역으로 교체 (tools/fake-trainer/unity_service.py)
 └── fake/                    대역 전용: 학습 루프, 장애 스위치, 제어 주소 /_fake/*
+    └── bff_sender.py        ← backend/fast_unity/unity/train_util/bff_sender.py 를 그대로 복사 (빌드 컨텍스트 realsender)
 ```
 
 - 실제 라우트 `app/api/routes/train.py`가 `UnityService`를 import하는 그 자리를 대역 구현으로 바꿉니다. 그래서 주소, 요청 검증(422), 응답 형식, 예외 시 500 응답은 실제 코드가 그대로 만듭니다.
 - 대역 `UnityService`는 실제 코드의 상태 확인 조건과 `RuntimeError` 메시지를 그대로 따릅니다. 학습·추론 루프만 Unity와 SB3 없이 스텝 수를 늘리는 가짜 루프로 바꿨습니다.
+- BFF로 보내는 지표·완료 신호의 전송 대기열(재전송 포함, 이슈 #16)은 실제 파일을 그대로 씁니다. 대역은 시도마다 결과를 전송 기록에 남기는 부분만 붙입니다. 그래서 대역으로 잰 재전송 결과가 곧 실제 전송 코드의 결과입니다.
 - `fake.main`은 구성이 잘못되어 실제 `UnityService`가 들어 있으면 기동하지 않고 실패합니다.
 - Python 의존성은 실제 학습 서버 lock과 같은 버전입니다(`requirements.in` 참고).
 
@@ -29,7 +31,7 @@
 |---|---|
 | BFF 명령 수신(시작·일시정지·재개·중지·속도·피드백·추론) | 실제 라우트 + 대역 서비스 |
 | 알고리즘·환경 목록, 산출물 확인·다운로드·삭제 | 실제 코드 그대로 |
-| 지표 전송, 완료 신호 (학습 서버 → BFF) | 같은 주소·본문·timeout·실패 처리 |
+| 지표 전송, 완료 신호 (학습 서버 → BFF) | 같은 주소·본문·timeout, 전송 대기열은 실제 파일 그대로 |
 | SB3 학습 계산 | 없음. 진행률로 만든 가짜 지표 값 |
 | 모델 파일(학습 종료 시), 학습 로그 CSV(학습 시작 시 생성) | 같은 시점에 만드는 내용 없는 가짜 파일 (산출물 API가 실제처럼 동작하게 하는 용도). CSV는 에피소드 대신 지표마다 한 줄 |
 | Unity 시뮬레이션, 사이드 채널 | 없음. 사이드 채널 명령(`init`, `stop`, `resume`, `simSpeed`)은 기록만 함 |
@@ -46,11 +48,11 @@
 |---|---|---|
 | 학습 시작, 스레드에서 실행 | `app/services/unity_service.py:39`, `:64` (`run_in_executor`) | `unity_service.py` `start` |
 | 일시정지·재개·중지 상태 확인과 예외 | `app/services/unity_service.py:68`, `:88`, `:104` | `unity_service.py` 같은 메서드 |
-| 일시정지 중 대기(0.3초 간격), 중지 신호 확인 | `unity/train_util/training_state.py:114-136` | `fake/training.py` `run_fake_training` |
-| 지표 전송 시점: on-policy(ppo, a2c)는 롤아웃마다(n_steps), off-policy는 1000스텝마다 | `unity/train_util/real_time_log_callback.py:28`, `:52`, `:54-67`, `:167` | `_metric_interval`, 루프 |
-| 지표 본문 `{runId, phase, timestamp, timesteps, metrics[{name, value, group}]}`, 값 반올림 규칙 | `real_time_log_callback.py:103-144` | `_build_metrics_payload`, `_format_metric_value` |
-| 지표 전송: 학습 스레드에서 동기 호출, timeout 2초, 실패하면 로그만 남기고 버림(재시도 없음) | `real_time_log_callback.py:177-194` | `_post` |
-| 학습 종료: 모델 저장 → 완료 신호 1회 `{status: STOPPED or COMPLETED}`, timeout 5초 | `training_state.py:139-170` | 루프 끝 |
+| 일시정지 중 대기(0.3초 간격), 중지 신호 확인 | `unity/train_util/training_state.py:115-137` | `fake/training.py` `run_fake_training` |
+| 지표 전송 시점: on-policy(ppo, a2c)는 롤아웃마다(n_steps), off-policy는 1000스텝마다 | `unity/train_util/real_time_log_callback.py:29`, `:53`, `:55-68`, `:168` | `_metric_interval`, 루프 |
+| 지표 본문 `{runId, phase, timestamp, timesteps, metrics[{name, value, group}]}`, 값 반올림 규칙 | `real_time_log_callback.py:104-145` | `_build_metrics_payload`, `_format_metric_value` |
+| 지표 전송: 전송 대기열에 넣기만 함(timeout 2초). 전송 스레드가 순서대로 보내고, 네트워크 오류·5xx는 1·2·4… 최대 30초 간격 재전송, 2xx·409는 성공, 그 밖의 4xx는 버림. 대기열 최대 1,000개 (이슈 #16) | `real_time_log_callback.py:178-191`, `unity/train_util/bff_sender.py` | `SENDER.send` (같은 파일) |
+| 학습 종료: 모델 저장 → 완료 신호 `{status: STOPPED or COMPLETED}`(timeout 5초)를 같은 대기열 끝에 넣음. 남은 지표를 다 보낸 뒤 보내고 실패하면 재전송 | `training_state.py:140-170` | 루프 끝 |
 | 종료 후 상태 초기화 | `unity/train/train_runner.py:62`, `app/services/unity_service.py:26` | `finish_train_callback` |
 | 학습 중 예외: 완료 신호 없이 상태만 초기화 | `train_runner.py:61-62` (`finally`만 실행) | 장애 스위치 `crash` |
 | 환경 생성 후 사이드 채널 `init`(환경 파라미터) | `unity/train/env_factory.py:36`, `:55` | 학습·추론 시작 시 기록 |
@@ -84,11 +86,11 @@ $COMPOSE down -v                                          # 정리 (볼륨까지
 
 | 요청 | 동작 |
 |---|---|
-| `GET /_fake/state` | 학습·추론 상태, 진행 스텝, 현재 스위치, 최근 사이드 채널 명령 |
+| `GET /_fake/state` | 학습·추론 상태, 진행 스텝, 현재 스위치, 최근 사이드 채널 명령, 전송 대기열(`sender`: 남은 수·버린 수) |
 | `PUT /_fake/faults` | 바꿀 항목만 보냄. 예: `{"steps_per_sec": 4096}` |
 | `POST /_fake/faults/reset` | 모든 스위치를 기본값으로 |
 | `POST /_fake/crash` | 진행 중인 학습 스레드를 완료 신호 없이 종료. 학습 루프가 끝난 뒤(모델 저장·완료 신호 전송 중)에는 409로 거절 |
-| `GET /_fake/sent?run_id=` | 대역이 BFF로 보낸 요청마다 결과(응답 코드 또는 `error:<예외>`) |
+| `GET /_fake/sent?run_id=` | 대역이 BFF로 보낸 요청의 시도마다 결과(응답 코드 또는 `error:<예외>`), 분류(`outcome`), 시도 번호 |
 | `DELETE /_fake/sent` | 전송 기록 비우기 |
 
 | 스위치 | 의미 |
@@ -110,6 +112,7 @@ python3 tools/fake-trainer/scenarios/run_scenarios.py all --out /tmp/fake-result
 | `normal` | 학습 시작 → 지표가 DB·SSE로 전달 → 일시정지·재개·속도 변경 → 완료, 그리고 중지 |
 | `bff-restart` | 학습 중 BFF를 `--down-sec`(기본 5초) 동안 내렸다 올렸을 때, 대역이 보낸 지표 중 DB에 남지 않은 개수와 상태 변화 |
 | `bff-freeze` | 학습 중 BFF가 `--freeze-sec`(기본 5초) 동안 응답만 멈췄을 때(프로세스 정지), 대역이 실패(timeout)로 기록한 지표 중 실제로는 DB에 저장된 개수, 학습이 늦어진 시간 |
+| `bff-down-at-end` | 학습이 끝날 때 BFF가 내려가 있을 때(마지막 지표 4개를 보낼 때 내리고, 학습이 끝난 뒤 `--end-down-sec`(기본 5초) 더 내려 둠), 마지막 지표와 완료 신호가 도착하는지, 완료 신호가 마지막 지표보다 뒤에 오는지 (이슈 #16) |
 | `duplicate` | 같은 지표를 두 번 보냈을 때 두 번째 응답(409)과 DB 중복 여부 |
 | `faults` | 학습 루프 멈춤, 학습 스레드 비정상 종료, 제어 명령 지연·실패에 대한 BFF 반응 |
 
@@ -117,7 +120,7 @@ python3 tools/fake-trainer/scenarios/run_scenarios.py all --out /tmp/fake-result
   - 대역과 측정 도구가 의도대로 동작하는가
   - 장애가 없을 때의 정상 흐름과 불변 조건(예: 같은 지표가 여러 번 와도 DB에는 한 번만 저장). 보완 작업 뒤에도 유지되어야 하므로 회귀 확인으로 씁니다.
 - 장애 상황에서 BFF가 보이는 현재 반응(예: BFF 재시작 후 학습 중인 실험이 FAILED로 바뀜, 중복 전송에 409)은 보완으로 바뀔 대상이라 판정하지 않고 관찰값(`observed`)으로 기록합니다. 보완 작업에서는 이 관찰값을 "보완 전" 숫자로 씁니다.
-- 시나리오가 중간에 실패해도 다음 시나리오가 깨끗한 상태에서 시작하도록, 시나리오마다 장애 스위치를 끄고 남은 학습을 중지합니다.
+- 시나리오가 중간에 실패해도 다음 시나리오가 깨끗한 상태에서 시작하도록, 시나리오마다 장애 스위치를 끄고 남은 학습을 중지하고, 전송 대기열이 빌 때까지 기다립니다.
 - 화면 차트 대신 차트가 구독하는 BFF SSE 스트림을 직접 받아 셉니다. 브라우저의 재연결과 차트에 실제로 들어간 지표는 `tools/browser-e2e`(이슈 #9)로 잽니다.
 - CI(`.github/workflows/fake-trainer.yml`)에서 같은 시나리오를 실행하고, 결과 JSON과 컨테이너 로그를 아티팩트로 남깁니다.
 

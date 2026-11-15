@@ -5,6 +5,7 @@ from collections import deque
 import requests
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3 import DQN, SAC, DDPG, TD3 # Off-policy 알고리즘
+from unity.train_util.bff_sender import get_sender
 
 def _py_scalar(x: Any):
     if isinstance(x, np.generic):
@@ -185,10 +186,6 @@ class StreamTrainMetricsCallback(BaseCallback):
         """
         if not self.http_endpoint_url:
             return
-        try:
-            # HTTP 요청은 학습 루프를 느리게 할 수 있으므로 timeout을 짧게 설정합니다.
-            # `json` 파라미터는 dict를 자동으로 JSON으로 직렬화하고 헤더를 설정합니다.
-            requests.post(self.http_endpoint_url, json=payload, timeout=2)
-        except requests.RequestException as e:
-            if self.verbose > 0:
-                print(f"[HTTP][ERROR] Failed to send metrics: {e}")
+        # 전송 대기열에 넣기만 한다. 전송·재시도는 전송 스레드가 순서대로 하므로 학습 루프는 기다리지 않는다. (이슈 #16)
+        get_sender().send("metric", self.http_endpoint_url, payload, timeout=2,
+                          run_id=self.run_id, timesteps=payload["timesteps"])
