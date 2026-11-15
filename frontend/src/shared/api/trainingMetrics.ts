@@ -51,10 +51,12 @@ export interface TrainingMetricsResponse {
 export const trainingMetricsApi = {
   /**
    * 실험의 훈련 메트릭 조회
-   * GET /api/runs/:runId/training-metrics
+   * GET /api/runs/:runId/training-metrics[?afterTimesteps=N]
+   * @param afterTimesteps - 주면 이 스텝보다 큰 지표만 받는다 (SSE 재연결 때 끊긴 구간 채우기, 이슈 #10)
    */
-  getRunMetrics: (runId: string): Promise<ApiResponse<TrainingMetricsResponse>> => {
-    return ApiClient.get(`/runs/${runId}/training-metrics`);
+  getRunMetrics: (runId: string, afterTimesteps?: number): Promise<ApiResponse<TrainingMetricsResponse>> => {
+    const query = afterTimesteps === undefined ? '' : `?afterTimesteps=${afterTimesteps}`;
+    return ApiClient.get(`/runs/${runId}/training-metrics${query}`);
   },
 
   /**

@@ -1,7 +1,7 @@
 // frontend/src/features/dashboard/hooks/useRunIdFromUrl.ts
 import { useEffect } from 'react';
 import { useSearchParams } from 'react-router-dom';
-import { useExperimentStore } from '@/store/experimentStore';
+import { useExperimentStore, toChartPoint } from '@/store/experimentStore';
 import { runsApi, templatesApi, trainingMetricsApi } from '@/shared/api';
 import { useToastNotification } from '@/shared/hooks';
 import { UILogger } from '@/shared/utils/logger';
@@ -29,7 +29,8 @@ export function useRunIdFromUrl(): {
   const setTemplateData = useExperimentStore((state) => state.setTemplateData);
   
   // 메트릭 관련 상태
-  const setTrainingMetrics = useExperimentStore((state) => state.setTrainingMetrics);
+  const mergeTrainingMetrics = useExperimentStore((state) => state.mergeTrainingMetrics);
+  const resetTrainingMetrics = useExperimentStore((state) => state.resetTrainingMetrics);
   
   // 토스트 알림 함수들
   const { showSuccess, showError } = useToastNotification();
@@ -84,13 +85,13 @@ export function useRunIdFromUrl(): {
         const metrics = response.data.metrics;
         
         // 메트릭 데이터를 차트 형식으로 변환
-        const chartData = metrics.map(metric => ({
-          timesteps: metric.timesteps,
-          ...metric.chartMetrics
-        }));
+        const chartData = metrics.map(metric => toChartPoint(metric.timesteps, metric.chartMetrics));
         
-        // 전역 상태에 메트릭 저장
-        setTrainingMetrics(chartData);
+        // 덮어쓰지 않고 스텝 기준으로 병합한다. 응답을 기다리는 동안 SSE로 받은 지표를 지우지 않기 위해서다. (이슈 #10)
+        // 응답이 늦게 와서 그사이 다른 실험으로 바뀌었으면 버린다.
+        if (useExperimentStore.getState().runId === runId) {
+          mergeTrainingMetrics(chartData);
+        }
         
         UILogger.action('메트릭 복구 성공', { 
           runId, 
@@ -99,11 +100,9 @@ export function useRunIdFromUrl(): {
         });
       } else {
         UILogger.action('메트릭 데이터 없음', { runId });
-        setTrainingMetrics([]);
       }
     } catch (error) {
       UILogger.error('useRunIdFromUrl', `메트릭 복구 실패: ${error}`);
-      setTrainingMetrics([]);
     }
   };
 
@@ -142,6 +141,8 @@ export function useRunIdFromUrl(): {
         // 2. 상태가 running 또는 paused인지 확인
         if (runData.status === 'RUNNING' || runData.status === 'PAUSED') {
           // 3. 기본 실험 정보 복원
+          // 이전 실험의 차트 데이터는 실험을 바꾸기 전에 비운다. (이후 지표는 모두 병합으로 들어온다)
+          resetTrainingMetrics();
           setRunId(targetRunId);
           setRunName(runData.runName || `Run ${targetRunId}`);
           setTrainingStatus(runData.status as 'idle' | 'running' | 'paused' | 'failed' | 'completed' | 'stopped');
