@@ -13,25 +13,17 @@ import {
 const router = Router();
 
 // runId별로 SSE 클라이언트 관리
+// 끊긴 구간은 화면이 다시 연결할 때 DB에서 채운다(이슈 #10). 그래서 서버는 이벤트 ID와 재전송 버퍼를 두지 않는다.
 const runClients: { [runId: string]: Set<Response> } = {};
-
-// 이벤트 ID 관리 (Last Event ID 지원용)
-let globalEventId = 0;
-const getNextEventId = () => ++globalEventId;
-
-// 이벤트 버퍼링 (재연결 시 누락된 이벤트 전송용)
-const eventBuffer: { [runId: string]: Array<{id: number, data: any, timestamp: number}> } = {};
-const MAX_BUFFER_SIZE = 50; // 최근 50개 이벤트만 버퍼링
 
 // ObjectId 유효성 검사 헬퍼 함수
 const isValidObjectId = (id: string): boolean => {
   return mongoose.Types.ObjectId.isValid(id);
 };
 
-// SSE 엔드포인트 - runId별 실시간 메트릭 스트림 (Last Event ID 지원)
+// SSE 엔드포인트 - runId별 실시간 메트릭 스트림
 router.get('/api/training-metrics/stream/:runId', (req: Request, res: Response) => {
   const { runId } = req.params;
-  const lastEventId = req.headers['last-event-id'] as string;
 
   // runId 유효성 검사
   if (!runId || !isValidObjectId(runId)) {
@@ -44,8 +36,7 @@ router.get('/api/training-metrics/stream/:runId', (req: Request, res: Response) 
     'Cache-Control': 'no-cache',
     'Connection': 'keep-alive',
     'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Headers': 'Cache-Control, Last-Event-ID',
-    'Access-Control-Expose-Headers': 'Last-Event-ID',
+    'Access-Control-Allow-Headers': 'Cache-Control',
     'X-Accel-Buffering': 'no' // Nginx 버퍼링 비활성화
   });
 
@@ -55,34 +46,17 @@ router.get('/api/training-metrics/stream/:runId', (req: Request, res: Response) 
   }
   runClients[runId]!.add(res);
 
-  // 이벤트 버퍼 초기화
-  if (!eventBuffer[runId]) {
-    eventBuffer[runId] = [];
-  }
+  console.log(`SSE client connected for runId: ${runId}`);
 
-  console.log(`SSE client connected for runId: ${runId}${lastEventId ? ` (resuming from event ${lastEventId})` : ''}`);
+  // 연결 확인 메시지 전송
+  // 반드시 클라이언트를 등록한 뒤에 보낸다. 화면은 connected를 받은 뒤 마지막 스텝 이후를 DB에서 채우므로,
+  // 그전에 저장된 지표는 DB 조회에, 그 뒤 지표는 이 연결로 들어와 빈틈이 생기지 않는다. (이슈 #10)
+  res.write(`data: ${JSON.stringify({ type: 'connected', runId })}\n\n`);
 
-  // 연결 확인 메시지 전송 (ID 포함)
-  const connectionEventId = getNextEventId();
-  res.write(`id: ${connectionEventId}\ndata: ${JSON.stringify({ type: 'connected', runId })}\n\n`);
-
-  // Last Event ID가 있으면 누락된 이벤트 전송
-  if (lastEventId) {
-    const lastId = parseInt(lastEventId);
-    const bufferedEvents = eventBuffer[runId] || [];
-    const missedEvents = bufferedEvents.filter(event => event.id > lastId);
-    
-    console.log(`Sending ${missedEvents.length} missed events for runId: ${runId}`);
-    missedEvents.forEach(event => {
-      res.write(`id: ${event.id}\ndata: ${JSON.stringify(event.data)}\n\n`);
-    });
-  }
-
-  // 하트비트 메커니즘 (30초마다 ping 전송)
+  // 하트비트 메커니즘 (30초마다 ping 전송). 화면은 65초 동안 신호가 없으면 다시 연결한다.
   const heartbeatInterval = setInterval(() => {
     try {
-      const heartbeatId = getNextEventId();
-      res.write(`id: ${heartbeatId}\ndata: ${JSON.stringify({ type: 'ping', timestamp: Date.now() })}\n\n`);
+      res.write(`data: ${JSON.stringify({ type: 'ping', timestamp: Date.now() })}\n\n`);
     } catch (error) {
       console.error('Heartbeat error:', error);
       clearInterval(heartbeatInterval);
@@ -161,30 +135,13 @@ router.post("/training-metrics", async (req, res) => {
         timesteps, 
         chartMetrics: cleanedChartMetrics 
       };
-      const eventId = getNextEventId();
-      
-      // 이벤트를 버퍼에 저장 (Last Event ID 지원용)
-      if (!eventBuffer[runId]) {
-        eventBuffer[runId] = [];
-      }
-      
-      eventBuffer[runId]!.push({
-        id: eventId,
-        data: payload,
-        timestamp: Date.now()
-      });
-      
-      // 버퍼 크기 제한 (메모리 관리)
-      if (eventBuffer[runId]!.length > MAX_BUFFER_SIZE) {
-        eventBuffer[runId]!.shift();
-      }
       
       console.log('payload', payload);
-      console.log(`📤 Sending SSE event ${eventId} to ${runClients[runId]!.size} clients for runId: ${runId}`);
+      console.log(`📤 Sending SSE event to ${runClients[runId]!.size} clients for runId: ${runId}`);
       
       runClients[runId]!.forEach((res: Response) => {
         try {
-          res.write(`id: ${eventId}\ndata: ${JSON.stringify(payload)}\n\n`);
+          res.write(`data: ${JSON.stringify(payload)}\n\n`);
         } catch (error) {
           console.error('❌ Error sending to SSE client:', error);
           // 연결이 끊어진 클라이언트 제거
