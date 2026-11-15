@@ -8,6 +8,7 @@ from fastapi import APIRouter, Body, HTTPException
 
 from app.api.routes import train as train_routes
 from fake.faults import FAULTS, PROGRESS, SENT_LOG
+from fake.training import SENDER
 
 router = APIRouter(prefix="/_fake", tags=["fake-trainer"])
 
@@ -29,6 +30,8 @@ def get_state() -> dict[str, Any]:
         "faults": FAULTS.get().to_dict(),
         "crash_pending": FAULTS.crash_pending(),
         "side_channel": svc.side_channel.recent(),
+        # 전송 대기열: 남은 항목 수, 넘쳐서 버린 수, 거절(4xx)되어 버린 수 (이슈 #16)
+        "sender": SENDER.stats(),
     }
 
 

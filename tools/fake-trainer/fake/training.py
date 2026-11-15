@@ -7,6 +7,7 @@
 - 일시정지·중지:  unity/train_util/training_state.py PauseResumeCallback._on_step
 - 지표 전송:      unity/train_util/real_time_log_callback.py StreamTrainMetricsCallback
 - 완료 신호:      unity/train_util/training_state.py PauseResumeCallback._on_training_end
+- 전송 대기열:    unity/train_util/bff_sender.py (이미지 빌드 때 fake/bff_sender.py로 그대로 복사, 이슈 #16)
 - 추론:           unity/train/train_runner.py test_model
 
 SB3 학습 대신 스텝 수만 늘리고, 지표 값은 진행률로 만든 가짜 값이다.
@@ -27,6 +28,7 @@ from typing import Any
 
 import requests
 
+from fake.bff_sender import BffSender, Item
 from fake.faults import FAULTS, PROGRESS, SENT_LOG
 
 MODELS_PATH = Path("/app/models")
@@ -39,7 +41,7 @@ ON_POLICY = {"ppo", "a2c"}
 DEFAULT_N_STEPS = {"ppo": 2048, "a2c": 5}
 # StreamTrainMetricsCallback(log_interval_steps=1000) 기본값
 OFF_POLICY_LOG_INTERVAL = 1000
-# 실제 코드의 timeout 값 (real_time_log_callback.py:191, training_state.py:169, train_runner.py:106)
+# 실제 코드의 timeout 값 (real_time_log_callback.py:190, training_state.py:170, train_runner.py:106)
 METRICS_TIMEOUT_SEC = 2
 COMPLETION_TIMEOUT_SEC = 5
 # PauseResumeCallback(check_interval=0.3)
@@ -58,10 +60,22 @@ def _api_base() -> str | None:
     return os.getenv("API_SERVER_URL")
 
 
+def _record_attempt(item: Item, result: Any, outcome: str, elapsed_ms: int) -> None:
+    """전송 대기열의 시도마다 결과를 전송 기록에 남긴다. (대역 전용)"""
+    meta = dict(item.meta)
+    SENT_LOG.add(kind=item.kind, run_id=meta.pop("run_id", None), result=result, outcome=outcome,
+                 attempt=item.attempts, elapsed_ms=elapsed_ms, **meta)
+
+
+# 실제 학습 서버의 get_sender()와 같이 프로세스에 하나인 전송 대기열.
+# 전송·재시도 로직은 실제 파일 그대로이고, 시도마다 기록을 남기는 부분만 대역이 붙인다.
+SENDER = BffSender(on_attempt=_record_attempt)
+
+
 def _post(kind: str, url: str, payload: dict[str, Any], timeout: float,
           run_id: str, **extra: Any) -> None:
-    """실제 코드처럼 응답 코드는 보지 않고, 네트워크 오류만 잡아 로그를 남긴다.
-    대역은 결과를 전송 기록에 함께 남긴다."""
+    """추론 종료 신호(test-completed)용 직접 전송. 실제 train_runner.py처럼 한 번만 보내고,
+    응답 코드는 보지 않고 네트워크 오류만 잡아 로그를 남긴다. 대역은 결과를 전송 기록에 함께 남긴다."""
     t0 = time.monotonic()
     try:
         resp = requests.post(url, json=payload, timeout=timeout)
@@ -256,21 +270,21 @@ def run_fake_training(req, state, run_id: str, service) -> None:
                     f.write(f"{num},{episode},0,{kvs['rollout/ep_rew_mean']:.3f},"
                             f"{kvs['rollout/ep_len_mean']:.0f},{time.time():.3f}\n")
                 if metrics_endpoint:
-                    # 실제와 같이 학습 스레드에서 동기 호출, 실패하면 버린다. (재시도 없음)
+                    # 실제와 같이 전송 대기열에 넣기만 한다. 전송·재시도는 전송 스레드가 한다. (이슈 #16)
                     sends = 2 if FAULTS.get().duplicate_metrics else 1
                     for _ in range(sends):
-                        _post("metric", metrics_endpoint, payload, METRICS_TIMEOUT_SEC,
-                              run_id, timesteps=num, phase=phase)
+                        SENDER.send("metric", metrics_endpoint, payload, METRICS_TIMEOUT_SEC,
+                                    run_id=run_id, timesteps=num, phase=phase)
                 next_metric += interval
 
         # 루프가 끝났으므로 이후의 비정상 종료 요청은 받지 않는다. (/_fake/crash가 확인)
         PROGRESS.set(loop_active=False)
-        # PauseResumeCallback._on_training_end: 모델 저장 → 완료 신호 1회
+        # PauseResumeCallback._on_training_end: 모델 저장 → 완료 신호를 전송 대기열 끝에 넣음
         _save_fake_model(req.model_name)
         if base and run_id:
             status = "STOPPED" if triggered else "COMPLETED"
-            _post("experiment-completed", f"{base}/callbacks/{run_id}/experiment-completed",
-                  {"status": status}, COMPLETION_TIMEOUT_SEC, run_id, status=status)
+            SENDER.send("experiment-completed", f"{base}/callbacks/{run_id}/experiment-completed",
+                        {"status": status}, COMPLETION_TIMEOUT_SEC, run_id=run_id, status=status)
     except FakeCrash as e:
         print(f"[fake] {e}")
     finally:

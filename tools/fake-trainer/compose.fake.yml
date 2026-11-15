@@ -18,6 +18,7 @@ services:
       dockerfile: Dockerfile
       additional_contexts:
         realapp: ./backend/fast_unity/app
+        realsender: ./backend/fast_unity/unity/train_util
     # 실제 모델·로그 폴더(저장소 안)에 가짜 파일을 쓰지 않도록 이름 있는 볼륨을 쓴다.
     volumes: !override
       - fake_models:/app/models
