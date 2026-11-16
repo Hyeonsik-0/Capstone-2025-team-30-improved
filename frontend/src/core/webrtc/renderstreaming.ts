@@ -75,6 +75,8 @@ export class RenderStreaming {
   public onGotAnswer: ConnectionHandler;
   public onTrackEvent: TrackEventHandler;
   public onAddChannel: DataChannelHandler;
+  /** 영상 경로(ICE)가 열렸을 때 (이슈 #18) */
+  public onIceConnected: ConnectionHandler;
 
   constructor(signaling: SignalingInterface, config: RTCConfiguration) {
     // 기본 이벤트 핸들러 설정
@@ -102,6 +104,10 @@ export class RenderStreaming {
       WebRTCLogger.event(`onAddChannel event peer with data: ${data}`);
     };
 
+    this.onIceConnected = (connectionId: string) => {
+      WebRTCLogger.connection(`ICE connected on ${connectionId}`);
+    };
+
     this._config = config;
     this._signaling = signaling;
 
@@ -120,6 +126,10 @@ export class RenderStreaming {
     });
     this._signaling.addEventListener('candidate', (e: Event) => {
       this._onIceCandidate(e as CustomEvent<CandidateEventDetail>);
+    });
+    // 시그널링 WebSocket이 닫히면 연결이 끊긴 것으로 알린다. (이슈 #18)
+    this._signaling.addEventListener('close', () => {
+      this.onDisconnect('Signaling connection closed');
     });
   }
 
@@ -249,6 +259,10 @@ export class RenderStreaming {
     // Peer 이벤트 핸들러 설정
     this._peer.addEventListener('disconnect', () => {
       this.onDisconnect(`Receive disconnect message from peer. connectionId:${connectionId}`);
+    });
+
+    this._peer.addEventListener('iceconnected', () => {
+      this.onIceConnected(connectionId);
     });
 
     this._peer.addEventListener('trackevent', (e: Event) => {
