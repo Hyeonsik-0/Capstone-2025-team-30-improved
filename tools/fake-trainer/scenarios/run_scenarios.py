@@ -681,6 +681,7 @@ def scenario_trainer_crash(ctx: Ctx) -> dict[str, Any]:
     must(http("POST", f"{ctx.fake}/_fake/crash"))
     wait_trainer_idle(ctx, 10)
     failed_after = _seconds_until(lambda: run_status(ctx, run_id) == "FAILED", t_fault, STALE_LIMIT_SEC)
+    time.sleep(1)  # 상태 기록기가 마지막 변화를 잡을 시간
     status_changes = recorder.stop()
     checks = {
         "crash_sends_no_completion": len(completion_items(ctx, run_id)) == 0,
@@ -716,6 +717,7 @@ def scenario_trainer_paused(ctx: Ctx) -> dict[str, Any]:
     must(http("POST", f"{ctx.fake}/_fake/crash"))
     wait_trainer_idle(ctx, 10)
     failed_after = _seconds_until(lambda: run_status(ctx, run_id) == "FAILED", t_fault, STALE_LIMIT_SEC)
+    time.sleep(1)  # 상태 기록기가 마지막 변화를 잡을 시간
     status_changes = recorder.stop()
     checks = {
         "trainer_paused": bool(trainer_paused),
@@ -756,6 +758,7 @@ def scenario_trainer_exit(ctx: Ctx) -> dict[str, Any]:
             if back_after is None and _fake_up(ctx):
                 back_after = elapsed
             time.sleep(0.5)
+        time.sleep(1)  # 상태 기록기가 마지막 변화를 잡을 시간
         status_changes = recorder.stop()
         after = _trainer_container(ctx)
     finally:
