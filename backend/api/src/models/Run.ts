@@ -67,7 +67,12 @@ const RunSchema = new Schema({
   /* 실행 요약 */
   totalSteps: { type: Number, default: 100000 },
   startTime:  { type: Date },
-  endTime:    { type: Date }
+  endTime:    { type: Date },
+
+  /* 학습 서버가 마지막으로 생존 신호를 보낸 시각 (이슈 #21) */
+  lastHeartbeatAt: { type: Date },
+  /* 실패 이유. 스키마에 없으면 Mongoose가 갱신에서 빼서 저장되지 않는다. (이슈 #21) */
+  error: { type: String }
 }, { timestamps: true });
 
 /* 인덱스 */

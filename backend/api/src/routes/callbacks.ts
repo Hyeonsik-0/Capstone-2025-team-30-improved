@@ -9,6 +9,7 @@ import {
   logError, 
   logInfo 
 } from "../utils/apiHelpers";
+import { ACTIVE_STATUSES } from "../utils/runWatchdog";
 
 const router = Router();
 const FASTAPI_BASE = process.env.FASTAPI_BASE || 'http://localhost:8000';
@@ -172,9 +173,39 @@ export const testCompletedHandler = async (req: Request, res: Response): Promise
   }
 };
 
+/**
+ * 학습 서버 생존 신호 핸들러 (이슈 #21)
+ * POST /callbacks/:id/heartbeat
+ *
+ * 학습 스레드가 도는 동안 10초마다 온다. 진행 중(RUNNING·PAUSED)인 실험의 마지막 신호 시각만 갱신한다.
+ * 이미 끝난 실험은 바꾸지 않으므로, 응답 없음으로 FAILED가 된 실험도 되돌아가지 않는다.
+ * 10초마다 오므로 성공은 로그로 남기지 않는다.
+ */
+const heartbeatHandler = async (req: Request, res: Response): Promise<void> => {
+  const runId = validateId(req, res);
+  if (!runId) return;
+
+  try {
+    const result = await RunModel.updateOne(
+      { _id: runId, status: { $in: ACTIVE_STATUSES } },
+      { $set: { lastHeartbeatAt: new Date() } }
+    );
+    if (result.matchedCount === 0) {
+      // 없는 실험이거나 이미 끝난 실험. 학습 서버는 응답을 보지 않고 다음 신호를 보낸다.
+      sendErrorResponse(res, 409, "Run is not running or paused");
+      return;
+    }
+    res.status(204).end();
+  } catch (error) {
+    logError("Heartbeat", error, { runId });
+    sendErrorResponse(res, 500, "Failed to record heartbeat");
+  }
+};
+
 // ===== 라우트 정의 =====
 
 router.post("/:id/experiment-completed", asyncHandler(experimentCompletedHandler));
 router.post("/:id/test-completed", asyncHandler(testCompletedHandler));
+router.post("/:id/heartbeat", asyncHandler(heartbeatHandler));
 
 export default router;

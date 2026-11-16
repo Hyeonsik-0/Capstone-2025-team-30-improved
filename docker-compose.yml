@@ -32,6 +32,9 @@ services:
       - unity-network
     depends_on:
       - signaling-server
+    # 프로세스가 죽으면 다시 띄운다. 진행 중이던 학습은 이어 하지 않으므로(체크포인트 없음),
+    # 그 실험은 생존 신호가 끊겨 BFF가 FAILED로 판정한다. (이슈 #21)
+    restart: unless-stopped
 
   # Node.js API 서버 (BFF)
   api-server:

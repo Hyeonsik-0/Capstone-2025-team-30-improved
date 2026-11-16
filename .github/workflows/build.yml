@@ -210,6 +210,42 @@ jobs:
           grep -q '^UNITY_HANDSHAKE_SECONDS=' "$OUT/smoke-noexec.txt"
           echo "실행 권한 없이 마운트해도 entrypoint가 권한을 부여해 Unity 기동"
 
+      - name: 컨테이너 재시작 뒤 Xvfb·Unity 기동 확인 (이슈 #21)
+        # 학습 서버에 restart 정책을 두면, 프로세스가 죽었을 때 같은 컨테이너가 파일을 그대로 가진 채 다시 뜬다.
+        # 이전 Xvfb가 남긴 잠금 파일이 있어도 화면(Xvfb :1)과 Unity가 다시 뜨는지 본다.
+        timeout-minutes: 10
+        run: |
+          # 앞 단계의 Unity 로그를 덮어쓰지 않도록 출력 폴더를 따로 둔다.
+          mkdir -p "$OUT/restart"
+          cid=$(docker run -d --restart unless-stopped \
+            -v "$PWD/backend/fast_unity/unity/envs:/app/unity/envs" \
+            -v "$CI_SCRIPTS:/ci:ro" \
+            -v "$OUT/restart:/ci-out" \
+            mlagents-gym:first)
+          trap 'docker logs "$cid" > "$OUT/restart/container.log" 2>&1; docker rm -f "$cid" > /dev/null' EXIT
+          up() {
+            docker exec "$cid" python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/', timeout=2)" > /dev/null 2>&1
+          }
+          restarts() { docker inspect -f '{{.RestartCount}}' "$cid"; }
+          for _ in $(seq 60); do up && break; sleep 1; done
+          up
+          docker exec "$cid" xdpyinfo -display :1 > /dev/null
+          echo "첫 기동: 학습 서버 응답, Xvfb :1 응답"
+
+          # 학습 서버 프로세스(PID 1)를 끝낸다. 컨테이너가 멈추며 Xvfb도 함께 끝나 잠금 파일이 남을 수 있다.
+          docker exec "$cid" python -c "import os, signal; os.kill(1, signal.SIGTERM)"
+          for _ in $(seq 60); do [ "$(restarts)" -ge 1 ] && up && break; sleep 1; done
+          [ "$(restarts)" -ge 1 ] && up
+          echo "재시작 횟수: $(restarts), 학습 서버 응답"
+          docker exec "$cid" ls -la /tmp/.X11-unix /tmp/.X1-lock || true
+          docker exec "$cid" cat /tmp/xvfb.log | tee "$OUT/restart/xvfb.log"
+          docker exec "$cid" xdpyinfo -display :1 > /dev/null \
+            || { echo "::error::재시작 뒤 Xvfb :1이 응답하지 않음"; exit 1; }
+          echo "재시작 뒤 Xvfb :1 응답"
+          docker exec "$cid" python /ci/unity_smoke.py car 300 | tee "$OUT/restart/smoke.txt"
+          grep -q '^UNITY_HANDSHAKE_SECONDS=' "$OUT/restart/smoke.txt"
+          echo "재시작 뒤 Unity 기동"
+
       - name: 결과 요약
         if: always()
         run: |
@@ -228,6 +264,10 @@ jobs:
             if [ -f "$OUT/smoke.txt" ]; then
               echo "- Unity 기동:"
               grep '^UNITY_' "$OUT/smoke.txt" | sed 's/^/  - /' || true
+            fi
+            if [ -f "$OUT/restart/smoke.txt" ]; then
+              echo "- 컨테이너 재시작 뒤 Unity 기동:"
+              grep '^UNITY_' "$OUT/restart/smoke.txt" | sed 's/^/  - /' || true
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 

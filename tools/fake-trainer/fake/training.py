@@ -8,6 +8,7 @@
 - 지표 전송:      unity/train_util/real_time_log_callback.py StreamTrainMetricsCallback
 - 완료 신호:      unity/train_util/training_state.py PauseResumeCallback._on_training_end
 - 전송 대기열:    unity/train_util/bff_sender.py (이미지 빌드 때 fake/bff_sender.py로 그대로 복사, 이슈 #16)
+- 생존 신호:      unity/train/train_runner.py run_training의 start_heartbeat·stop (이슈 #21)
 - 추론:           unity/train/train_runner.py test_model
 
 SB3 학습 대신 스텝 수만 늘리고, 지표 값은 진행률로 만든 가짜 값이다.
@@ -28,7 +29,7 @@ from typing import Any
 
 import requests
 
-from fake.bff_sender import BffSender, Item
+from fake.bff_sender import BffSender, Item, start_heartbeat
 from fake.faults import FAULTS, PROGRESS, SENT_LOG
 
 MODELS_PATH = Path("/app/models")
@@ -41,7 +42,7 @@ ON_POLICY = {"ppo", "a2c"}
 DEFAULT_N_STEPS = {"ppo": 2048, "a2c": 5}
 # StreamTrainMetricsCallback(log_interval_steps=1000) 기본값
 OFF_POLICY_LOG_INTERVAL = 1000
-# 실제 코드의 timeout 값 (real_time_log_callback.py:190, training_state.py:170, train_runner.py:106)
+# 실제 코드의 timeout 값 (real_time_log_callback.py:190, training_state.py:170, train_runner.py:113)
 METRICS_TIMEOUT_SEC = 2
 COMPLETION_TIMEOUT_SEC = 5
 # PauseResumeCallback(check_interval=0.3)
@@ -70,6 +71,13 @@ def _record_attempt(item: Item, result: Any, outcome: str, elapsed_ms: int) -> N
 # 실제 학습 서버의 get_sender()와 같이 프로세스에 하나인 전송 대기열.
 # 전송·재시도 로직은 실제 파일 그대로이고, 시도마다 기록을 남기는 부분만 대역이 붙인다.
 SENDER = BffSender(on_attempt=_record_attempt)
+
+
+def _heartbeat_recorder(run_id: str):
+    """생존 신호의 시도마다 결과를 전송 기록에 남긴다. (대역 전용)"""
+    def record(result: Any, elapsed_ms: int) -> None:
+        SENT_LOG.add(kind="heartbeat", run_id=run_id, result=result, elapsed_ms=elapsed_ms)
+    return record
 
 
 def _post(kind: str, url: str, payload: dict[str, Any], timeout: float,
@@ -208,7 +216,10 @@ def _save_fake_model(model_name: str) -> None:
 
 def run_fake_training(req, state, run_id: str, service) -> None:
     """train_runner.run_training 대역. 실제와 같이 run_in_executor 스레드에서 실행된다."""
+    heartbeat = None
     try:
+        # 실제와 같이 학습 스레드가 도는 동안 생존 신호를 보낸다. (이슈 #21)
+        heartbeat = start_heartbeat(_api_base(), run_id, on_attempt=_heartbeat_recorder(run_id))
         interval = _metric_interval(req)
         on_policy = req.algorithm in ON_POLICY
         # on-policy는 롤아웃 단위로 진행하므로 total을 넘겨 롤아웃 경계까지 간다.
@@ -291,6 +302,8 @@ def run_fake_training(req, state, run_id: str, service) -> None:
         # 처리되지 않은 비정상 종료 요청이 다음 학습으로 넘어가지 않게 지운다.
         FAULTS.consume_crash()
         PROGRESS.set(loop_active=False, finished=True)
+        if heartbeat is not None:
+            heartbeat.stop()
         service.finish_train_callback()
 
 

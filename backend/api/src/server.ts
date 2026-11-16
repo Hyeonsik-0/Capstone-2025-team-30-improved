@@ -4,6 +4,7 @@ import cors from "cors";
 import { connectMongo } from './db/mongoose';
 import { RunModel } from './models/Run';
 import { logInfo, logError } from './utils/apiHelpers';
+import { startRunWatchdog } from './utils/runWatchdog';
 
 import runsRoutes from './routes/runs';
 import callbacksRoutes from './routes/callbacks';
@@ -37,27 +38,12 @@ app.use("/callbacks", callbacksRoutes);
 const server = http.createServer(app);
 
 /**
- * 서버 시작 시 실행 중인 run들을 FAILED로 변경하고, 테스트 중인 모델들을 IDLE로 변경
- * 강제 종료되었거나 비정상적으로 RUNNING 상태로 남아있는 run들을 정리합니다.
- * 테스트 중이던 모델들은 IDLE 상태로 복구합니다.
+ * 서버 시작 시 테스트 중인 모델들을 IDLE로 변경
+ * 진행 중(RUNNING·PAUSED)인 실험은 여기서 정리하지 않는다. BFF만 재시작됐다면 학습은 계속되고 있으므로,
+ * 학습 서버의 생존 신호로 판단한다. (utils/runWatchdog.ts, 이슈 #21)
  */
-const cleanupRunningAndTestingRuns = async (): Promise<void> => {
+const cleanupTestingRuns = async (): Promise<void> => {
   try {
-    // RUNNING 상태인 run들을 FAILED로 변경
-    const runningRunsResult = await RunModel.updateMany(
-      { 
-        status: "RUNNING"
-      },
-      { 
-        $set: { 
-          status: "FAILED",
-          testStatus: "INVALID",
-          endTime: new Date(),
-          error: "Server restart - run was forcefully terminated"
-        } 
-      }
-    );
-
     // TESTING 상태인 모델들을 IDLE로 변경 (status가 RUNNING이 아닌 경우)
     const testingModelsResult = await RunModel.updateMany(
       { 
@@ -71,30 +57,26 @@ const cleanupRunningAndTestingRuns = async (): Promise<void> => {
       }
     );
 
-    if (runningRunsResult.modifiedCount > 0) {
-      logInfo("Server Startup", `Cleaned up ${runningRunsResult.modifiedCount} running runs`, {
-        modifiedCount: runningRunsResult.modifiedCount
-      });
-    }
-
     if (testingModelsResult.modifiedCount > 0) {
       logInfo("Server Startup", `Reset ${testingModelsResult.modifiedCount} testing models to IDLE`, {
         modifiedCount: testingModelsResult.modifiedCount
       });
     }
 
-    if (runningRunsResult.modifiedCount === 0 && testingModelsResult.modifiedCount === 0) {
-      logInfo("Server Startup", "No running runs or testing models found to cleanup");
+    if (testingModelsResult.modifiedCount === 0) {
+      logInfo("Server Startup", "No testing models found to cleanup");
     }
   } catch (error) {
-    logError("Server Startup", error, { message: "Failed to cleanup running runs and testing models" });
+    logError("Server Startup", error, { message: "Failed to cleanup testing models" });
   }
 };
 
 const port = Number(process.env.PORT || 8080);
 connectMongo().then(async () => {
-  // 서버 시작 시 실행 중인 run들 정리
-  await cleanupRunningAndTestingRuns();
+  // 서버 시작 시 테스트 중인 모델 정리
+  await cleanupTestingRuns();
   
   server.listen(port, () => console.log(`API & SSE server running on :${port}`));
+  // 학습 서버 응답 없음 판정 (이슈 #21)
+  startRunWatchdog();
 });
