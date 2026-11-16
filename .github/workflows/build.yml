@@ -232,7 +232,7 @@ jobs:
           docker exec "$cid" xdpyinfo -display :1 > /dev/null
           echo "첫 기동: 학습 서버 응답, Xvfb :1 응답"
 
-          # 학습 서버 프로세스(PID 1)를 끝낸다. 컨테이너가 멈추며 Xvfb는 잠금 파일을 지우지 못한다.
+          # 학습 서버 프로세스(PID 1)를 끝낸다. 컨테이너가 멈추며 Xvfb도 함께 끝나 잠금 파일이 남을 수 있다.
           docker exec "$cid" python -c "import os, signal; os.kill(1, signal.SIGTERM)"
           for _ in $(seq 60); do [ "$(restarts)" -ge 1 ] && up && break; sleep 1; done
           [ "$(restarts)" -ge 1 ] && up
