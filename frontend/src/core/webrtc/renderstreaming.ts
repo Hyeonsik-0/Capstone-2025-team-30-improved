@@ -67,6 +67,7 @@ export class RenderStreaming {
   private _connectionId: string | null = null;
   private _config: RTCConfiguration;
   private _signaling: SignalingInterface;
+  private _stopping: boolean = false; // stop()으로 닫는 중에는 시그널링 close를 끊김으로 알리지 않는다
 
   // 공개 이벤트 핸들러
   public onConnect: ConnectionHandler;
@@ -75,6 +76,8 @@ export class RenderStreaming {
   public onGotAnswer: ConnectionHandler;
   public onTrackEvent: TrackEventHandler;
   public onAddChannel: DataChannelHandler;
+  /** 영상 경로(ICE)가 열렸을 때 (이슈 #18) */
+  public onIceConnected: ConnectionHandler;
 
   constructor(signaling: SignalingInterface, config: RTCConfiguration) {
     // 기본 이벤트 핸들러 설정
@@ -102,6 +105,10 @@ export class RenderStreaming {
       WebRTCLogger.event(`onAddChannel event peer with data: ${data}`);
     };
 
+    this.onIceConnected = (connectionId: string) => {
+      WebRTCLogger.connection(`ICE connected on ${connectionId}`);
+    };
+
     this._config = config;
     this._signaling = signaling;
 
@@ -120,6 +127,12 @@ export class RenderStreaming {
     });
     this._signaling.addEventListener('candidate', (e: Event) => {
       this._onIceCandidate(e as CustomEvent<CandidateEventDetail>);
+    });
+    // 시그널링 WebSocket이 닫히면 연결이 끊긴 것으로 알린다. (이슈 #18)
+    this._signaling.addEventListener('close', () => {
+      if (!this._stopping) {
+        this.onDisconnect('Signaling connection closed');
+      }
     });
   }
 
@@ -251,6 +264,10 @@ export class RenderStreaming {
       this.onDisconnect(`Receive disconnect message from peer. connectionId:${connectionId}`);
     });
 
+    this._peer.addEventListener('iceconnected', () => {
+      this.onIceConnected(connectionId);
+    });
+
     this._peer.addEventListener('trackevent', (e: Event) => {
       const customEvent = e as CustomEvent;
       const data = customEvent.detail as RTCTrackEvent;
@@ -371,6 +388,7 @@ export class RenderStreaming {
    * 스트리밍 중지 및 정리
    */
   async stop(): Promise<void> {
+    this._stopping = true;
     if (this._peer) {
       this._peer.close();
       this._peer = null;

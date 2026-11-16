@@ -105,9 +105,16 @@ export default class Peer extends EventTarget {
       this.log(`signalingState changed:${this.pc!.signalingState}`);
     };
 
+    // 영상 경로 상태 (이슈 #18)
+    // - connected·completed: 경로가 열림 → 'iceconnected'
+    // - disconnected·failed: 경로가 끊김 → 'disconnect'
+    //   disconnected는 브라우저가 이미 수 초 동안 응답을 받지 못한 뒤에 나오므로 더 기다리지 않는다. (측정 약 6.4초)
     this.pc.oniceconnectionstatechange = () => {
-      this.log(`iceConnectionState changed:${this.pc!.iceConnectionState}`);
-      if (this.pc!.iceConnectionState === 'disconnected') {
+      const state = this.pc!.iceConnectionState;
+      this.log(`iceConnectionState changed:${state}`);
+      if (state === 'connected' || state === 'completed') {
+        this.dispatchEvent(new Event('iceconnected'));
+      } else if (state === 'disconnected' || state === 'failed') {
         this.dispatchEvent(new Event('disconnect'));
       }
     };

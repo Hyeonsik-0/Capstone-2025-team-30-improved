@@ -193,6 +193,7 @@ export class WebSocketSignaling extends EventTarget {
     this.websocket.onclose = (event) => {
       WebSocketLogger.error(`연결 끊어짐: code=${event.code}, reason=${event.reason}, wasClean=${event.wasClean}`);
       this.isWsOpen = false;
+      this.dispatchEvent(new Event('close')); // 연결 관리 쪽에서 실패로 처리한다 (이슈 #18)
     };
 
     this.websocket.onmessage = (event: MessageEvent) => {
@@ -252,6 +253,10 @@ export class WebSocketSignaling extends EventTarget {
 
   async start(): Promise<void> {
     while (!this.isWsOpen) {
+      // 열리기 전에 닫히면 끝없이 기다리지 않고 실패한다. (이슈 #18)
+      if (this.websocket.readyState === WebSocket.CLOSED) {
+        throw new Error('시그널링 WebSocket이 열리기 전에 닫힘');
+      }
       await this.sleep(100);
     }
   }
