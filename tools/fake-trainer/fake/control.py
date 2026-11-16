@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import threading
 from typing import Any, Optional
 
 from fastapi import APIRouter, Body, HTTPException
@@ -64,6 +66,17 @@ def crash() -> dict[str, Any]:
     if not (_service().train_states.is_running and PROGRESS.snapshot().get("loop_active")):
         raise HTTPException(status_code=409, detail="진행 중인 학습 루프가 없습니다.")
     FAULTS.request_crash()
+    return {"accepted": True}
+
+
+@router.post("/exit")
+def exit_process() -> dict[str, Any]:
+    """학습 서버 프로세스가 비정상 종료된 상황(메모리 부족 등)을 흉내 낸다. (이슈 #21)
+
+    응답을 보낸 뒤 프로세스를 종료 코드 1로 끝낸다. 진행 중이던 학습과 전송 대기열도 함께 사라진다.
+    컨테이너에 restart 정책이 있으면 다시 뜨고, 없으면 내려간 채 남는다.
+    """
+    threading.Timer(0.3, os._exit, args=(1,)).start()
     return {"accepted": True}
 
 
