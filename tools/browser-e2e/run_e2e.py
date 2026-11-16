@@ -31,15 +31,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-# 학습 서버 대역 측정 시나리오의 BFF·대역 조작 함수를 그대로 쓴다.
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "fake-trainer" / "scenarios"))
-import run_scenarios as rs  # noqa: E402
+from playwright.sync_api import Browser, Page, sync_playwright
+from playwright.sync_api import TimeoutError as PlaywrightTimeout
 
-from playwright.sync_api import Browser, Page, sync_playwright  # noqa: E402
-from playwright.sync_api import TimeoutError as PlaywrightTimeout  # noqa: E402
+import webrtc
+from common import WEB_PROXY as PROXY
+from common import Cfg, add_common_args, now_ms, proxies_ready, rs, toxi
 
 N_STEPS = 2048  # PPO n_steps. 대역은 n_steps마다 지표를 1개 보낸다.
-PROXY = "web"
 HALF_OPEN_TOXIC = "half_open"
 BEFORE_FAULT_METRICS = 8  # 장애를 넣기 전에 정상으로 받을 지표 수
 AFTER_FAULT_SEC = 10  # 복구 뒤 학습이 더 진행되는 시간
@@ -83,33 +82,7 @@ READ_STORE = """() => {
 }"""
 
 
-def now_ms() -> int:
-    return int(time.time() * 1000)
-
-
-class Cfg:
-    def __init__(self, args: argparse.Namespace) -> None:
-        self.ctx = rs.Ctx(argparse.Namespace(bff=args.bff, fake=args.fake, project="rl-e2e"))
-        self.toxiproxy = args.toxiproxy.rstrip("/")
-        self.web = args.web.rstrip("/")
-        self.upstream = args.upstream
-        self.out_dir = Path(args.out).parent if args.out else None
-
-
 # ---------------------------------------------------------------- Toxiproxy (브라우저–nginx 사이)
-
-def toxi(cfg: Cfg, method: str, path: str, body: Any = None) -> Any:
-    return rs.must(rs.http(method, f"{cfg.toxiproxy}{path}", body, timeout=10), ok=(200, 201, 204))
-
-
-def proxy_ready(cfg: Cfg) -> None:
-    """프록시가 없으면 만들고, 있으면 초기 상태(켜짐, toxic 없음)로 되돌린다."""
-    status, _ = rs.http("GET", f"{cfg.toxiproxy}/proxies/{PROXY}", timeout=10)
-    if status == 404:
-        toxi(cfg, "POST", "/proxies", {"name": PROXY, "listen": "0.0.0.0:8080",
-                                       "upstream": cfg.upstream, "enabled": True})
-    toxi(cfg, "POST", "/reset")
-
 
 def inject(cfg: Cfg, kind: str) -> None:
     if kind == "drop":
@@ -214,7 +187,7 @@ def run_case(cfg: Cfg, browser: Browser, name: str, *, metrics_per_sec: int, n_m
     # 학습 루프를 멈춘 채 시작해 두고, 화면의 복원·SSE 연결이 끝난 뒤 풀어 준다.
     # (페이지 진입 복원과 SSE 수신이 겹치는 경합은 #10의 대상이라 이 측정에서는 피한다)
     rs.fake_faults(ctx, {"steps_per_sec": N_STEPS * metrics_per_sec, "stall": True}, reset=True)
-    proxy_ready(cfg)
+    proxies_ready(cfg)
     run_id = rs.start_run(ctx, f"e2e-{name}", "ppo", {"n_steps": N_STEPS}, N_STEPS * n_metrics)
     rs.wait_until(lambda: rs.run_status(ctx, run_id) == "RUNNING", 30, what="실험 RUNNING")
 
@@ -305,7 +278,7 @@ def run_case(cfg: Cfg, browser: Browser, name: str, *, metrics_per_sec: int, n_m
 
 def cleanup(cfg: Cfg) -> None:
     try:
-        proxy_ready(cfg)
+        proxies_ready(cfg)
     except Exception as e:
         print(f"  정리 중 경고(toxiproxy): {type(e).__name__}: {e}")
     rs.cleanup(cfg.ctx)
@@ -322,12 +295,11 @@ def short(observed: dict[str, Any]) -> dict[str, Any]:
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("scenario", choices=["s0-normal", "s1-short-drop", "s2-long-drop", "s3-half-open", "all"])
-    p.add_argument("--bff", default="http://api-server:8080")
-    p.add_argument("--fake", default="http://mlagents-gym:8000")
-    p.add_argument("--toxiproxy", default="http://toxiproxy:8474", help="Toxiproxy API")
-    p.add_argument("--web", default="http://toxiproxy:8080", help="브라우저가 여는 주소 (Toxiproxy 경유)")
-    p.add_argument("--upstream", default="nginx:80", help="Toxiproxy가 넘겨 줄 웹 서버")
+    sse_names = ["s0-normal", "s1-short-drop", "s2-long-drop", "s3-half-open"]
+    p.add_argument("scenario", choices=sse_names + webrtc.NAMES + ["sse", "webrtc", "all"],
+                   help="시나리오 이름, 또는 묶음(sse: s0~s3, webrtc: w0~w4, all: 전부)")
+    add_common_args(p)
+    webrtc.add_args(p)
     p.add_argument("--drop-sec", type=float, default=10.0)
     p.add_argument("--long-drop-sec", type=float, default=20.0)
     p.add_argument("--stall-sec", type=float, default=90.0)
@@ -348,11 +320,14 @@ def main() -> int:
         # 90초 동안 멈추므로 학습이 너무 길어지지 않게 초당 1개로 보낸다.
         "s3-half-open": case("s3-half-open", 1, ("half-open", args.stall_sec)),
     }
-    names = list(runners) if args.scenario == "all" else [args.scenario]
+    runners.update(webrtc.runners(cfg, args))
+    groups = {"sse": sse_names, "webrtc": webrtc.NAMES, "all": sse_names + webrtc.NAMES}
+    names = groups.get(args.scenario, [args.scenario])
     results: dict[str, Any] = {}
     failed = False
     with sync_playwright() as pw:
-        browser = pw.chromium.launch()
+        # 같은 Docker 네트워크 안에서 ICE 후보가 mDNS 이름 대신 실제 주소로 나오게 한다 (측정 환경 설정, 이슈 #18)
+        browser = pw.chromium.launch(args=["--disable-features=WebRtcHideLocalIpsWithMdns"])
         results["_env"] = {"playwright_browser": f"chromium {browser.version}"}
         for name in names:
             print(f"\n=== {name} ===", flush=True)
@@ -370,7 +345,8 @@ def main() -> int:
                 failed |= not passed
             if "error" in res:
                 print(f"  error: {res['error']}")
-            print("  observed:", json.dumps(short(res.get("observed", {})), ensure_ascii=False, default=str), flush=True)
+            brief = webrtc.short if name in webrtc.NAMES else short
+            print("  observed:", json.dumps(brief(res.get("observed", {})), ensure_ascii=False, default=str), flush=True)
         browser.close()
 
     if args.out:
