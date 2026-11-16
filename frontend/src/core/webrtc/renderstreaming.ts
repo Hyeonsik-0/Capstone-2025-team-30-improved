@@ -67,6 +67,7 @@ export class RenderStreaming {
   private _connectionId: string | null = null;
   private _config: RTCConfiguration;
   private _signaling: SignalingInterface;
+  private _stopping: boolean = false; // stop()으로 닫는 중에는 시그널링 close를 끊김으로 알리지 않는다
 
   // 공개 이벤트 핸들러
   public onConnect: ConnectionHandler;
@@ -129,7 +130,9 @@ export class RenderStreaming {
     });
     // 시그널링 WebSocket이 닫히면 연결이 끊긴 것으로 알린다. (이슈 #18)
     this._signaling.addEventListener('close', () => {
-      this.onDisconnect('Signaling connection closed');
+      if (!this._stopping) {
+        this.onDisconnect('Signaling connection closed');
+      }
     });
   }
 
@@ -385,6 +388,7 @@ export class RenderStreaming {
    * 스트리밍 중지 및 정리
    */
   async stop(): Promise<void> {
+    this._stopping = true;
     if (this._peer) {
       this._peer.close();
       this._peer = null;
