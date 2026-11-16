@@ -53,11 +53,12 @@
 | 지표 본문 `{runId, phase, timestamp, timesteps, metrics[{name, value, group}]}`, 값 반올림 규칙 | `real_time_log_callback.py:104-145` | `_build_metrics_payload`, `_format_metric_value` |
 | 지표 전송: 전송 대기열에 넣기만 함(timeout 2초). 전송 스레드가 순서대로 보내고, 네트워크 오류·5xx는 1·2·4… 최대 30초 간격 재전송, 2xx·409는 성공, 그 밖의 4xx는 버림. 대기열 최대 1,000개 (이슈 #16) | `real_time_log_callback.py:178-191`, `unity/train_util/bff_sender.py` | `SENDER.send` (같은 파일) |
 | 학습 종료: 모델 저장 → 완료 신호 `{status: STOPPED or COMPLETED}`(timeout 5초)를 같은 대기열 끝에 넣음. 남은 지표를 다 보낸 뒤 보내고 실패하면 재전송 | `training_state.py:140-170` | 루프 끝 |
-| 종료 후 상태 초기화 | `unity/train/train_runner.py:62`, `app/services/unity_service.py:26` | `finish_train_callback` |
-| 학습 중 예외: 완료 신호 없이 상태만 초기화 | `train_runner.py:61-62` (`finally`만 실행) | 장애 스위치 `crash` |
+| 생존 신호: 학습 스레드가 도는 동안(Unity 기동·일시정지 포함) 10초마다 `POST /callbacks/:id/heartbeat`(timeout 3초). 지표 대기열과 따로 보내고 재전송하지 않음. 학습 스레드가 끝나면(정상·예외) 멈춤 (이슈 #21) | `unity/train/train_runner.py:32`, `:66-68`, `bff_sender.py` `Heartbeat` | `start_heartbeat` (같은 파일). 시도마다 전송 기록에 `heartbeat`로 남김 |
+| 종료 후 상태 초기화 | `unity/train/train_runner.py:69`, `app/services/unity_service.py:26` | `finish_train_callback` |
+| 학습 중 예외: 완료 신호 없이 생존 신호를 멈추고 상태만 초기화 | `train_runner.py:65-69` (`finally`만 실행) | 장애 스위치 `crash` |
 | 환경 생성 후 사이드 채널 `init`(환경 파라미터) | `unity/train/env_factory.py:36`, `:55` | 학습·추론 시작 시 기록 |
 | 학습 시작 시 로그 CSV 생성 | `unity/train_util/logger_callback.py:20-34` | `_open_fake_csv` |
-| 추론 종료 신호 `test-completed` | `train_runner.py:98-108` | `run_fake_inference` |
+| 추론 종료 신호 `test-completed` | `train_runner.py:105-115` | `run_fake_inference` |
 | LLM 피드백: 메시지 저장 후 재개 | `unity/train_util/sentiment_feedback_wrapper.py:86-97` | `FakeLLMFeedback` |
 | uvicorn 실행 옵션 | `entrypoint.sh:56-58` | `Dockerfile` `CMD` |
 
@@ -97,7 +98,7 @@ $COMPOSE down -v                                          # 정리 (볼륨까지
 | 스위치 | 의미 |
 |---|---|
 | `steps_per_sec` | 학습 진행 속도. 실제 속도는 환경·배속에 따라 다르므로 시나리오에서 항상 지정 (기본값 1000은 실측값이 아님) |
-| `stall` | 학습 루프 멈춤. 진행·지표·완료 신호가 모두 멈추고, HTTP 요청에는 계속 응답. 멈춘 동안에는 중지 신호도 확인하지 못함 |
+| `stall` | 학습 루프 멈춤. 진행·지표·완료 신호가 모두 멈추고, HTTP 요청에는 계속 응답. 멈춘 동안에는 중지 신호도 확인하지 못함. 학습 스레드는 살아 있으므로 생존 신호는 계속 보냄(실제로 Unity가 응답하지 않으면 ML-Agents가 60초 뒤 예외를 내 `crash`와 같은 경로가 되지만, 대역은 이를 흉내 내지 않음) |
 | `duplicate_metrics` | 같은 지표를 두 번 전송 |
 | `control.<start,pause,resume,stop>.fail` | 상태를 바꾸기 전에 실패 → 실제 서버와 같이 500 |
 | `control.<start,pause,resume,stop>.delay_sec` | 상태를 바꾼 뒤 응답만 늦춤 (명령은 처리됐는데 응답이 늦는 상황) |
@@ -123,7 +124,7 @@ python3 tools/fake-trainer/scenarios/run_scenarios.py all --out /tmp/fake-result
 - 판정(`PASS`/`FAIL`)은 두 가지만 봅니다.
   - 대역과 측정 도구가 의도대로 동작하는가
   - 장애가 없을 때의 정상 흐름과 불변 조건(예: 같은 지표가 여러 번 와도 DB에는 한 번만 저장). 보완 작업 뒤에도 유지되어야 하므로 회귀 확인으로 씁니다.
-- 장애 상황에서 BFF가 보이는 현재 반응(예: BFF 재시작 후 학습 중인 실험이 FAILED로 바뀜, 중복 전송에 409)은 보완으로 바뀔 대상이라 판정하지 않고 관찰값(`observed`)으로 기록합니다. 보완 작업에서는 이 관찰값을 "보완 전" 숫자로 씁니다.
+- 장애 상황에서 BFF가 보이는 현재 반응(예: BFF 재시작 후 학습 중인 실험의 상태, 학습 서버가 죽은 뒤 FAILED까지 걸린 시간)은 보완으로 바뀔 대상이라 판정하지 않고 관찰값(`observed`)으로 기록합니다. 보완 작업에서는 이 관찰값을 "보완 전" 숫자로 씁니다.
 - 시나리오가 중간에 실패해도 다음 시나리오가 깨끗한 상태에서 시작하도록, 시나리오마다 장애 스위치를 끄고 남은 학습을 중지하고, 전송 대기열이 빌 때까지 기다립니다.
 - 화면 차트 대신 차트가 구독하는 BFF SSE 스트림을 직접 받아 셉니다. 브라우저의 재연결과 차트에 실제로 들어간 지표는 `tools/browser-e2e`(이슈 #9)로 잽니다.
 - CI(`.github/workflows/fake-trainer.yml`)에서 같은 시나리오를 실행하고, 결과 JSON과 컨테이너 로그를 아티팩트로 남깁니다.

@@ -171,6 +171,13 @@ POST /callbacks/:id/experiment-completed
 POST /callbacks/:id/test-completed
 ```
 
+#### 3. 학습 서버 생존 신호
+```http
+POST /callbacks/:id/heartbeat
+```
+학습 서버가 학습 스레드가 도는 동안(일시정지 포함) 10초마다 보낸다. 진행 중(RUNNING·PAUSED)인 실험이면 마지막 신호 시각을 갱신하고 204, 아니면 409를 돌려준다.
+BFF는 10초마다 확인해 마지막 신호(없으면 시작 시각)가 60초보다 오래된 진행 중 실험을 FAILED로 바꾸고 `error`에 이유를 남긴다. BFF가 뜬 직후 60초는 판정하지 않는다. (`src/utils/runWatchdog.ts`, 이슈 #21)
+
 ### 훈련 메트릭 (Training Metrics)
 
 #### 1. 메트릭 조회

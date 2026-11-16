@@ -7,6 +7,7 @@ from unity.train_util.sidechannel import RLSideChannel
 from unity.train_util.training_state import UnityTrainingState, UnityInferenceState, PauseResumeCallback,CustomExplorationCallback
 from unity.train_util.logger_callback import EpisodeCSVCallback
 from unity.train_util.real_time_log_callback import StreamTrainMetricsCallback
+from unity.train_util.bff_sender import start_heartbeat
 from unity.train_util.gym_wrapper import MLAgentsGymWrapper
 from unity.train_util.sentiment_feedback_wrapper import SentimentLLMFeedback
 from unity.train_util.custom_extractor import AdvancedCombinedExtractorMultipleVectors
@@ -24,8 +25,11 @@ def run_training(req:TrainRequest , state: UnityTrainingState, side_channel :RLS
     
     env = None
     model_save_path = "models/"+ req.model_name+".zip"
+    heartbeat = None
     
     try :
+        # 학습 스레드가 도는 동안(Unity 기동·일시정지 포함) BFF에 생존 신호를 보낸다. (이슈 #21)
+        heartbeat = start_heartbeat(os.getenv("API_SERVER_URL"), experiment_id)
         env = make_env(req = req, side_channel = side_channel)
         adapter : AlgoAdapter= ALGORITHM_REGISTRY[req.algorithm]
         
@@ -59,6 +63,9 @@ def run_training(req:TrainRequest , state: UnityTrainingState, side_channel :RLS
         # init sidechannel message
     
     finally:
+        # 신호를 멈추면 BFF는 완료 신호가 오지 않는 한 일정 시간 뒤 이 실험을 실패로 판정한다.
+        if heartbeat is not None:
+            heartbeat.stop()
         service.finish_train_callback()
 
         if 'env' in locals():
