@@ -37,9 +37,6 @@ export default class Peer extends EventTarget {
   private warn: (str: string) => void;
   private assert_equals: AssertFunction;
   private sleep: (msec: number) => Promise<void>;
-  // ICE disconnected는 잠깐 끊겼다 스스로 돌아오기도 하므로 바로 끊김으로 보지 않는다. (이슈 #18)
-  private disconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  private static readonly DISCONNECTED_GRACE_MS = 5000;
 
   constructor(
     connectionId: string,
@@ -110,24 +107,15 @@ export default class Peer extends EventTarget {
 
     // 영상 경로 상태 (이슈 #18)
     // - connected·completed: 경로가 열림 → 'iceconnected'
-    // - failed: 경로가 끊김 → 'disconnect'
-    // - disconnected: 5초 안에 돌아오지 않으면 'disconnect'
+    // - disconnected·failed: 경로가 끊김 → 'disconnect'
+    //   disconnected는 브라우저가 이미 수 초 동안 응답을 받지 못한 뒤에 나오므로 더 기다리지 않는다. (측정 약 6.4초)
     this.pc.oniceconnectionstatechange = () => {
       const state = this.pc!.iceConnectionState;
       this.log(`iceConnectionState changed:${state}`);
       if (state === 'connected' || state === 'completed') {
-        this.clearDisconnectTimer();
         this.dispatchEvent(new Event('iceconnected'));
-      } else if (state === 'failed') {
-        this.clearDisconnectTimer();
+      } else if (state === 'disconnected' || state === 'failed') {
         this.dispatchEvent(new Event('disconnect'));
-      } else if (state === 'disconnected' && !this.disconnectTimer) {
-        this.disconnectTimer = setTimeout(() => {
-          this.disconnectTimer = null;
-          if (this.pc?.iceConnectionState === 'disconnected') {
-            this.dispatchEvent(new Event('disconnect'));
-          }
-        }, Peer.DISCONNECTED_GRACE_MS);
       }
     };
 
@@ -176,16 +164,8 @@ export default class Peer extends EventTarget {
     }
   }
 
-  private clearDisconnectTimer(): void {
-    if (this.disconnectTimer) {
-      clearTimeout(this.disconnectTimer);
-      this.disconnectTimer = null;
-    }
-  }
-
   close(): void {
     this.connectionId = null;
-    this.clearDisconnectTimer();
     if (this.pc) {
       this.pc.close();
       this.pc = null;

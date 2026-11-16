@@ -27,7 +27,7 @@ import { FlatCard } from '@/shared/components/ui/Card';
 /**
  * 영상(WebRTC) 연결 재시도 (이슈 #18)
  * - 연결 요청 후 CONNECT_TIMEOUT_MS 안에 영상 트랙과 ICE 연결이 모두 오지 않으면 실패로 본다.
- * - 시그널링 서버의 disconnect, ICE failed·disconnected 5초 지속(peer.ts), 시그널링 WebSocket 끊김도 실패다.
+ * - 시그널링 서버의 disconnect, ICE disconnected·failed(peer.ts), 시그널링 WebSocket 끊김도 실패다.
  * - 실패하면 정리하고, 학습 중(진행·일시정지)에는 횟수 제한 없이 1·2·4·8·16초, 이후 30초 간격으로 다시 연결한다.
  * - 연결 시작 조건은 그대로다: 이 화면에서 새 실험을 시작했을 때(자동), 재연결 버튼(즉시).
  */
