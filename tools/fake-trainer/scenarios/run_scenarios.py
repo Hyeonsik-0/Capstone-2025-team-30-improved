@@ -14,6 +14,9 @@
   bff-down-at-end  학습이 끝날 때 BFF가 내려가 있으면 마지막 지표와 완료 신호가 도착하는지 (이슈 #16)
   duplicate    같은 지표를 두 번 보냈을 때 BFF 응답과 DB 중복 여부
   faults       학습 루프 멈춤, 학습 스레드 비정상 종료, 제어 명령 지연·실패에 대한 BFF 반응
+  trainer-crash   학습 스레드가 완료 신호 없이 끝났을 때 실험이 FAILED로 바뀌기까지 걸린 시간 (이슈 #21)
+  trainer-paused  일시정지가 오래 이어져도 PAUSED로 남는지, 그 상태에서 학습 스레드가 끝나면 FAILED까지 걸린 시간
+  trainer-exit    학습 서버 프로세스가 죽었을 때 컨테이너가 다시 뜨는지, FAILED까지 걸린 시간
 
 각 시나리오는 판정(check)과 관찰값(observed)을 함께 출력한다.
 - 판정: 대역·측정 도구가 의도대로 동작하는가, 그리고 장애가 없을 때의 정상 흐름과 불변 조건
@@ -393,6 +396,8 @@ def scenario_bff_restart(ctx: Ctx, down_sec: float) -> dict[str, Any]:
             "failed_send_span_sec": _failed_send_span(failed),
             "completion_after_last_metric": completion_after_last_metric(sent["items"]),
             "status_changes": status_changes,
+            # 학습은 계속됐는데 BFF가 재시작하며 실험을 FAILED로 바꿨는가 (이슈 #21)
+            "failed_while_training": any(s == "FAILED" for _, s in status_changes),
             "final_status": run_status(ctx, run_id),
         },
     }
@@ -626,12 +631,164 @@ def scenario_faults(ctx: Ctx) -> dict[str, Any]:
     return out
 
 
+# ---------------------------------------------------------------- 응답 없음 판정 (이슈 #21)
+
+# 실험이 FAILED로 바뀌기를 기다리는 시간. 보완 기준(생존 신호 60초 없음 + 확인 주기 10초)에 여유를 더했다.
+STALE_LIMIT_SEC = 90
+# 일시정지를 유지하는 시간. 판정 기준(60초)보다 길어야 '살아 있으면 PAUSED 유지'를 확인할 수 있다.
+PAUSE_HOLD_SEC = 75
+
+
+def run_error(ctx: Ctx, run_id: str) -> Any:
+    """DB에 실제로 저장된 실패 이유. (스키마에 없는 필드는 저장되지 않으므로 DB를 직접 본다)"""
+    doc = mongo_eval(ctx, f'db.runs.findOne({{_id: ObjectId("{run_id}")}}, {{_id: 0, error: 1}})')
+    return (doc or {}).get("error")
+
+
+def _fake_up(ctx: Ctx) -> bool:
+    try:
+        return http("GET", f"{ctx.fake}/_fake/state", timeout=2)[0] == 200
+    except (urllib.error.URLError, ConnectionError, TimeoutError, OSError):
+        return False
+
+
+def _seconds_until(cond: Callable[[], Any], t0: float, limit: float, interval: float = 0.5) -> float | None:
+    """t0(monotonic)부터 cond가 참이 될 때까지 걸린 시간. limit초 안에 참이 되지 않으면 None."""
+    while time.monotonic() < t0 + limit:
+        if cond():
+            return round(time.monotonic() - t0, 1)
+        time.sleep(interval)
+    return None
+
+
+def _trainer_container(ctx: Ctx) -> dict[str, Any]:
+    cid = compose(ctx, "ps", "-a", "-q", "mlagents-gym").stdout.strip()
+    out = subprocess.run(["docker", "inspect", "-f",
+                          "{{.State.Status}} {{.RestartCount}} {{.HostConfig.RestartPolicy.Name}}", cid],
+                         check=True, capture_output=True, text=True).stdout.split()
+    return {"state": out[0], "restart_count": int(out[1]), "restart_policy": out[2] if len(out) > 2 else ""}
+
+
+def scenario_trainer_crash(ctx: Ctx) -> dict[str, Any]:
+    """학습 스레드가 완료 신호 없이 끝났을 때(학습 중 예외) 실험이 FAILED로 바뀌기까지 걸린 시간."""
+    fake_faults(ctx, {"steps_per_sec": 4096}, reset=True)
+    n_steps = 2048
+    run_id = start_run(ctx, "trainer-crash", "ppo", {"n_steps": n_steps}, n_steps * 1000)
+    wait_until(lambda: ok_metric_count(ctx, run_id) >= 3, 30, what="지표 3개")
+    recorder = StatusRecorder(ctx, run_id)
+    recorder.start()
+    t_fault = time.monotonic()
+    must(http("POST", f"{ctx.fake}/_fake/crash"))
+    wait_trainer_idle(ctx, 10)
+    failed_after = _seconds_until(lambda: run_status(ctx, run_id) == "FAILED", t_fault, STALE_LIMIT_SEC)
+    status_changes = recorder.stop()
+    checks = {
+        "crash_sends_no_completion": len(completion_items(ctx, run_id)) == 0,
+        "trainer_idle_after_crash": fake_state(ctx)["current_run_id"] is None,
+    }
+    return {"checks": checks, "observed": {
+        "run_id": run_id,
+        "limit_sec": STALE_LIMIT_SEC,
+        # None이면 limit_sec 동안 FAILED로 바뀌지 않았다는 뜻이다.
+        "failed_after_crash_sec": failed_after,
+        "status_changes": status_changes,
+        "final_status": run_status(ctx, run_id),
+        "error": run_error(ctx, run_id),
+    }}
+
+
+def scenario_trainer_paused(ctx: Ctx) -> dict[str, Any]:
+    """일시정지 중인 실험: 학습 서버가 살아 있으면 오래 멈춰 있어도 PAUSED로 남는지,
+    그 상태에서 학습 스레드가 끝나면 FAILED로 바뀌기까지 걸린 시간."""
+    fake_faults(ctx, {"steps_per_sec": 4096}, reset=True)
+    n_steps = 2048
+    run_id = start_run(ctx, "trainer-paused", "ppo", {"n_steps": n_steps}, n_steps * 1000)
+    wait_until(lambda: ok_metric_count(ctx, run_id) >= 3, 30, what="지표 3개")
+    must(http("POST", f"{ctx.bff}/api/runs/{run_id}/pause"))
+    trainer_paused = wait_until(lambda: fake_state(ctx)["train"]["is_paused"], 10, what="대역 일시정지")
+    recorder = StatusRecorder(ctx, run_id)
+    recorder.start()
+    time.sleep(PAUSE_HOLD_SEC)
+    status_after_hold = run_status(ctx, run_id)
+
+    # 일시정지 대기 중에도 비정상 종료 요청은 바로 적용된다. (fake/training.py)
+    t_fault = time.monotonic()
+    must(http("POST", f"{ctx.fake}/_fake/crash"))
+    wait_trainer_idle(ctx, 10)
+    failed_after = _seconds_until(lambda: run_status(ctx, run_id) == "FAILED", t_fault, STALE_LIMIT_SEC)
+    status_changes = recorder.stop()
+    checks = {
+        "trainer_paused": bool(trainer_paused),
+        "crash_sends_no_completion": len(completion_items(ctx, run_id)) == 0,
+    }
+    return {"checks": checks, "observed": {
+        "run_id": run_id,
+        "pause_hold_sec": PAUSE_HOLD_SEC,
+        "status_after_hold": status_after_hold,
+        "limit_sec": STALE_LIMIT_SEC,
+        "failed_after_crash_sec": failed_after,
+        "status_changes": status_changes,
+        "final_status": run_status(ctx, run_id),
+        "error": run_error(ctx, run_id),
+    }}
+
+
+def scenario_trainer_exit(ctx: Ctx) -> dict[str, Any]:
+    """학습 서버 프로세스가 학습 중에 비정상 종료됐을 때: 컨테이너가 다시 뜨는지,
+    실험이 FAILED로 바뀌기까지 걸린 시간."""
+    fake_faults(ctx, {"steps_per_sec": 4096}, reset=True)
+    n_steps = 2048
+    run_id = start_run(ctx, "trainer-exit", "ppo", {"n_steps": n_steps}, n_steps * 1000)
+    wait_until(lambda: ok_metric_count(ctx, run_id) >= 3, 30, what="지표 3개")
+    before = _trainer_container(ctx)
+    recorder = StatusRecorder(ctx, run_id)
+    recorder.start()
+    t_fault = time.monotonic()
+    must(http("POST", f"{ctx.fake}/_fake/exit"))
+    went_down = _seconds_until(lambda: not _fake_up(ctx), t_fault, 10, 0.1)
+
+    failed_after = back_after = None
+    try:
+        while time.monotonic() < t_fault + STALE_LIMIT_SEC and (failed_after is None or back_after is None):
+            elapsed = round(time.monotonic() - t_fault, 1)
+            if failed_after is None and run_status(ctx, run_id) == "FAILED":
+                failed_after = elapsed
+            if back_after is None and _fake_up(ctx):
+                back_after = elapsed
+            time.sleep(0.5)
+        status_changes = recorder.stop()
+        after = _trainer_container(ctx)
+    finally:
+        # 다음 시나리오를 위해 대역을 다시 띄운다. (restart 정책이 없으면 내려간 채 남는다)
+        if not _fake_up(ctx):
+            compose(ctx, "start", "mlagents-gym")
+            wait_until(lambda: _fake_up(ctx), 60, 0.5, "대역 재기동")
+    checks = {
+        # 측정 도구 확인: 대역 프로세스가 실제로 내려갔는가
+        "trainer_went_down": went_down is not None,
+    }
+    return {"checks": checks, "observed": {
+        "run_id": run_id,
+        "limit_sec": STALE_LIMIT_SEC,
+        "restart_policy": before["restart_policy"] or "없음",
+        # None이면 limit_sec 안에 다시 뜨지 않았다는 뜻이다.
+        "trainer_back_after_sec": back_after,
+        "restart_count_delta": after["restart_count"] - before["restart_count"],
+        "container_state_at_end": after["state"],
+        "failed_after_exit_sec": failed_after,
+        "status_changes": status_changes,
+        "final_status": run_status(ctx, run_id),
+        "error": run_error(ctx, run_id),
+    }}
+
+
 # ---------------------------------------------------------------- 실행
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("scenario", choices=["normal", "bff-restart", "bff-freeze", "bff-down-at-end",
-                                        "duplicate", "faults", "all"])
+                                        "duplicate", "faults", "trainer-crash", "trainer-paused",
+                                        "trainer-exit", "all"])
     p.add_argument("--bff", default="http://127.0.0.1:18080")
     p.add_argument("--fake", default="http://127.0.0.1:18000")
     p.add_argument("--project", default="rl-fake", help="docker compose 프로젝트 이름")
@@ -650,6 +807,9 @@ def main() -> int:
         "bff-down-at-end": lambda: scenario_bff_down_at_end(ctx, args.end_down_sec),
         "duplicate": lambda: scenario_duplicate(ctx),
         "faults": lambda: scenario_faults(ctx),
+        "trainer-crash": lambda: scenario_trainer_crash(ctx),
+        "trainer-paused": lambda: scenario_trainer_paused(ctx),
+        "trainer-exit": lambda: scenario_trainer_exit(ctx),
     }
     names = list(runners) if args.scenario == "all" else [args.scenario]
     results: dict[str, Any] = {}

@@ -90,6 +90,7 @@ $COMPOSE down -v                                          # 정리 (볼륨까지
 | `PUT /_fake/faults` | 바꿀 항목만 보냄. 예: `{"steps_per_sec": 4096}` |
 | `POST /_fake/faults/reset` | 모든 스위치를 기본값으로 |
 | `POST /_fake/crash` | 진행 중인 학습 스레드를 완료 신호 없이 종료. 학습 루프가 끝난 뒤(모델 저장·완료 신호 전송 중)에는 409로 거절 |
+| `POST /_fake/exit` | 응답한 뒤 대역 프로세스를 종료 코드 1로 끝냄(메모리 부족 등으로 학습 서버가 죽은 상황). 진행 중인 학습과 전송 대기열도 사라짐 |
 | `GET /_fake/sent?run_id=` | 대역이 BFF로 보낸 요청의 시도마다 결과(응답 코드 또는 `error:<예외>`), 분류(`outcome`), 시도 번호 |
 | `DELETE /_fake/sent` | 전송 기록 비우기 |
 
@@ -115,6 +116,9 @@ python3 tools/fake-trainer/scenarios/run_scenarios.py all --out /tmp/fake-result
 | `bff-down-at-end` | 학습이 끝날 때 BFF가 내려가 있을 때(마지막 지표 4개를 보낼 때 내리고, 학습이 끝난 뒤 `--end-down-sec`(기본 5초) 더 내려 둠), 마지막 지표와 완료 신호가 도착하는지, 완료 신호가 마지막 지표보다 뒤에 오는지 (이슈 #16) |
 | `duplicate` | 같은 지표를 두 번 보냈을 때 두 번째 응답(409)과 DB 중복 여부 |
 | `faults` | 학습 루프 멈춤, 학습 스레드 비정상 종료, 제어 명령 지연·실패에 대한 BFF 반응 |
+| `trainer-crash` | 학습 스레드가 완료 신호 없이 끝났을 때(학습 중 예외), 실험이 FAILED로 바뀌기까지 걸린 시간 (90초까지 기다림, 이슈 #21) |
+| `trainer-paused` | 일시정지를 75초 이어 가도 PAUSED로 남는지, 그 상태에서 학습 스레드가 끝나면 FAILED로 바뀌기까지 걸린 시간 |
+| `trainer-exit` | 학습 중 대역 프로세스가 종료 코드 1로 죽었을 때, 컨테이너가 다시 뜨는지와 실험이 FAILED로 바뀌기까지 걸린 시간. 다시 뜨지 않으면 시나리오가 끝날 때 직접 띄운다 |
 
 - 판정(`PASS`/`FAIL`)은 두 가지만 봅니다.
   - 대역과 측정 도구가 의도대로 동작하는가
